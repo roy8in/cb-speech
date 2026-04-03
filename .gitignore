@@ -7,4 +7,4 @@ __pycache__/
 .db
 data/speech_tracker/*.db*
 data/speech_tracker/*.sqlite
-docs/speech_tracker/data.json
+sync.log

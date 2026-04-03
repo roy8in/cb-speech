@@ -35,9 +35,10 @@ def run_analysis(since_year=None, limit=5000, reanalyze=False):
                 SELECT s.id, s.title, s.date, m.name as speaker, s.full_text 
                 FROM speeches s
                 LEFT JOIN members m ON s.speaker_id = m.id
+                LEFT JOIN analysis_results ar ON s.id = ar.speech_id
                 WHERE s.full_text IS NOT NULL 
                 AND length(s.full_text) > 500
-                AND s.analysis_attempts = 0
+                AND (ar.analysis_attempts IS NULL OR ar.analysis_attempts = 0)
             """
             
             if since_year:
@@ -54,10 +55,11 @@ def run_analysis(since_year=None, limit=5000, reanalyze=False):
                     SELECT s.id, s.title, s.date, m.name as speaker, s.full_text 
                     FROM speeches s
                     LEFT JOIN members m ON s.speaker_id = m.id
+                    LEFT JOIN analysis_results ar ON s.id = ar.speech_id
                     WHERE s.full_text IS NOT NULL 
                     AND length(s.full_text) > 500
-                    AND s.keywords IS NULL 
-                    AND s.analysis_attempts BETWEEN 1 AND 5
+                    AND (ar.keywords IS NULL OR ar.keywords = '[]')
+                    AND ar.analysis_attempts BETWEEN 1 AND 5
                 """
                 if since_year:
                     query += f" AND s.date >= '{since_year}-01-01'"
@@ -80,25 +82,45 @@ def run_analysis(since_year=None, limit=5000, reanalyze=False):
                 result = analyzer.analyze_text(text, date=date, speaker=speaker)
                 
                 if result and isinstance(result, dict):
+                    status = 'scored' if result.get('stance_score') is not None else 'no_signal'
                     conn.execute("""
-                        UPDATE speeches 
-                        SET stance_score = ?, stance_reason = ?, keywords = ?, main_risk = ?, analysis_attempts = analysis_attempts + 1 
-                        WHERE id = ?
-                    """, (result.get('stance_score'), result.get('stance_reason'), json.dumps(result.get('keywords')), result.get('main_risk'), speech_id))
+                        INSERT INTO analysis_results 
+                        (speech_id, stance_score, stance_reason, keywords, main_risk, analysis_attempts, analysis_status, analyzed_at)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, datetime('now'))
+                        ON CONFLICT(speech_id) DO UPDATE SET
+                            stance_score = excluded.stance_score,
+                            stance_reason = excluded.stance_reason,
+                            keywords = excluded.keywords,
+                            main_risk = excluded.main_risk,
+                            analysis_attempts = analysis_attempts + 1,
+                            analysis_status = excluded.analysis_status,
+                            analyzed_at = excluded.analyzed_at
+                    """, (speech_id, result.get('stance_score'), result.get('stance_reason'), 
+                          json.dumps(result.get('keywords')), result.get('main_risk'), status))
                     conn.commit()
                     success_count += 1
                     print(f"  -> SUCCESS: Score={result.get('stance_score')}")
                     time.sleep(3) 
                 else:
                     # Increment attempts to move it to the back of the queue
-                    conn.execute("UPDATE speeches SET analysis_attempts = analysis_attempts + 1 WHERE id = ?", (speech_id,))
+                    conn.execute("""
+                        INSERT INTO analysis_results (speech_id, analysis_attempts, analysis_status)
+                        VALUES (?, 1, 'pending')
+                        ON CONFLICT(speech_id) DO UPDATE SET
+                            analysis_attempts = analysis_attempts + 1
+                    """, (speech_id,))
                     conn.commit()
                     print(f"  -> SKIPPED (Null).")
                     time.sleep(1)
 
             except Exception as e:
                 print(f"  !! Error: {e}")
-                conn.execute("UPDATE speeches SET analysis_attempts = analysis_attempts + 1 WHERE id = ?", (speech_id,))
+                conn.execute("""
+                    INSERT INTO analysis_results (speech_id, analysis_attempts, analysis_status)
+                    VALUES (?, 1, 'pending')
+                    ON CONFLICT(speech_id) DO UPDATE SET
+                        analysis_attempts = analysis_attempts + 1
+                """, (speech_id,))
                 conn.commit()
                 time.sleep(5)
             

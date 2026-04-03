@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.speech_tracker.collector import run_collection
 from tools.speech_tracker.models import SpeechDB
 from tools.speech_tracker.analyzer import HawkDoveAnalyzer
+from tools.speech_tracker.exporter import PostgreExporter
 
 # Configure logging
 logging.basicConfig(
@@ -50,20 +51,18 @@ def main():
             logger.info(f"Batch complete. Total analyzed so far: {total_analyzed}")
             
         logger.info(f"Exhaustive analysis complete. Total new speeches analyzed: {total_analyzed}")
+
+        # 3. Sync with PostgreSQL
+        try:
+            logger.info("Syncing all newly analyzed speeches with PostgreSQL...")
+            exporter = PostgreExporter(db=db)
+            synced_count = exporter.upload_new_speeches(limit=1000)
+            logger.info(f"Synced {synced_count} speeches to PostgreSQL")
+        except Exception as e:
+            logger.error(f"PostgreSQL sync failed: {e}")
         
     except Exception as e:
         logger.error(f"Exhaustive analysis failed: {e}")
-
-    # 3. Update dashboard data
-    try:
-        logger.info("Updating dashboard data...")
-        from scripts.speech_tracker.generate_dashboard_data import update_dashboard
-        update_dashboard()
-        logger.info("Dashboard data updated successfully.")
-    except ImportError:
-        logger.warning("generate_dashboard_data.update_dashboard not found or failed to import.")
-    except Exception as e:
-        logger.error(f"Dashboard update failed: {e}")
 
     logger.info("Speech Tracker sync and analyze complete.")
 

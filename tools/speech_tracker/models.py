@@ -51,16 +51,24 @@ class SpeechDB:
                     url TEXT UNIQUE NOT NULL,
                     full_text TEXT,
                     speech_type TEXT DEFAULT 'speech',
-                    Language TEXT DEFAULT 'en',
+                    language TEXT DEFAULT 'en',
                     fetched_at TEXT NOT NULL,
                     created_at TEXT DEFAULT (datetime('now')),
+                    synced_at TEXT,
+                    FOREIGN KEY (speaker_id) REFERENCES members (id)
+                );
+
+                CREATE TABLE IF NOT EXISTS analysis_results (
+                    speech_id INTEGER PRIMARY KEY,
                     stance_score REAL,
                     stance_reason TEXT,
                     keywords TEXT, -- JSON array of {category, detail}
                     main_risk TEXT, -- Primary threat to policy goals
                     analysis_attempts INTEGER DEFAULT 0,
                     analysis_status TEXT DEFAULT 'pending', -- scored, no_signal, skipped, pending
-                    FOREIGN KEY (speaker_id) REFERENCES members (id)
+                    analyzed_at TEXT DEFAULT (datetime('now')),
+                    synced_at TEXT,
+                    FOREIGN KEY (speech_id) REFERENCES speeches (id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS members (
@@ -75,13 +83,14 @@ class SpeechDB:
                     last_verified_at TEXT,
                     last_updated TEXT DEFAULT (datetime('now')),
                     avg_stance_score REAL,
+                    synced_at TEXT,
                     UNIQUE(bank_code, name)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_speeches_bank ON speeches(bank_code);
                 CREATE INDEX IF NOT EXISTS idx_speeches_date ON speeches(date);
                 CREATE INDEX IF NOT EXISTS idx_speeches_speaker ON speeches(speaker_id);
-                CREATE INDEX IF NOT EXISTS idx_speeches_status ON speeches(analysis_status);
+                CREATE INDEX IF NOT EXISTS idx_analysis_status ON analysis_results(analysis_status);
                 CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
 
                 -- 3. 수집 로그 테이블
@@ -123,7 +132,7 @@ class SpeechDB:
             conn.close()
 
     def _migrate_db(self, conn):
-        """Add missing columns to existing tables."""
+        """Add missing columns and tables to existing databases."""
         # 1. Migrate members table
         cursor = conn.execute("PRAGMA table_info(members)")
         columns = [row['name'] for row in cursor.fetchall()]
@@ -134,7 +143,8 @@ class SpeechDB:
             ('last_speech_date', 'TEXT'),
             ('last_verified_at', 'TEXT'),
             ('last_updated', "TEXT DEFAULT (datetime('now'))"),
-            ('avg_stance_score', 'REAL')
+            ('avg_stance_score', 'REAL'),
+            ('synced_at', 'TEXT')
         ]
         
         for col_name, col_type in new_member_cols:
@@ -143,26 +153,62 @@ class SpeechDB:
                     conn.execute(f"ALTER TABLE members ADD COLUMN {col_name} {col_type}")
                 except sqlite3.OperationalError:
                     pass
-                    
-        # 2. Migrate speeches table
+        
+        # 2. Check if we need to split speeches and analysis_results
         cursor = conn.execute("PRAGMA table_info(speeches)")
         speech_cols = [row['name'] for row in cursor.fetchall()]
         
-        new_speech_cols = [
-            ('stance_score', 'REAL'),
-            ('stance_reason', 'TEXT'),
-            ('keywords', 'TEXT'),
-            ('main_risk', 'TEXT'),
-            ('analysis_attempts', 'INTEGER DEFAULT 0'),
-            ('analysis_status', "TEXT DEFAULT 'pending'")
-        ]
-        
-        for col_name, col_type in new_speech_cols:
-            if col_name not in speech_cols:
-                try:
-                    conn.execute(f"ALTER TABLE speeches ADD COLUMN {col_name} {col_type}")
-                except sqlite3.OperationalError:
-                    pass
+        if 'synced_at' not in speech_cols:
+            try:
+                conn.execute("ALTER TABLE speeches ADD COLUMN synced_at TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+        if 'analysis_status' in speech_cols:
+            # This database hasn't been split yet.
+            try:
+                # Copy data if analysis_results is empty or doesn't exist (created in _init_db)
+                conn.execute("""
+                    INSERT OR REPLACE INTO analysis_results 
+                    (speech_id, stance_score, stance_reason, keywords, main_risk, analysis_attempts, analysis_status)
+                    SELECT id, stance_score, stance_reason, keywords, main_risk, analysis_attempts, analysis_status
+                    FROM speeches
+                    WHERE analysis_status IS NOT NULL
+                """)
+                
+                # Remove columns from speeches
+                cols_to_remove = [
+                    'stance_score', 'stance_reason', 'keywords', 'main_risk', 
+                    'analysis_attempts', 'analysis_status'
+                ]
+                conn.execute("DROP INDEX IF EXISTS idx_speeches_status")
+                for col in cols_to_remove:
+                    if col in speech_cols:
+                        conn.execute(f"ALTER TABLE speeches DROP COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+
+        # 3. Migrate analysis_results table — add synced_at column
+        cursor = conn.execute("PRAGMA table_info(analysis_results)")
+        ar_cols = [row['name'] for row in cursor.fetchall()]
+        if 'synced_at' not in ar_cols:
+            try:
+                conn.execute("ALTER TABLE analysis_results ADD COLUMN synced_at TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+    def log_collection_result(self, started_at, finished_at, status, bank_stats, total_new, error_msg=None):
+        """Record the result of a collection run in the database."""
+        conn = self._get_conn()
+        try:
+            conn.execute("""
+                INSERT INTO collection_logs 
+                (started_at, finished_at, status, bank_stats_json, total_new_speeches, error_message)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (started_at, finished_at, status, json.dumps(bank_stats), total_new, error_msg))
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_or_create_member(self, bank_code, name, role=None, status='active'):
         """회원 ID를 반환하거나 없으면 생성 (정보 업데이트 포함)"""
@@ -248,6 +294,31 @@ class SpeechDB:
         finally:
             conn.close()
 
+    def get_unsynced_members(self, limit=100):
+        """동기화되지 않은 위원 데이터 조회"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT * FROM members 
+                WHERE synced_at IS NULL OR last_updated > synced_at
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_members_as_synced(self, member_ids):
+        """위원 데이터를 동기화 완료로 표시"""
+        if not member_ids:
+            return
+        conn = self._get_conn()
+        try:
+            placeholders = ', '.join(['?'] * len(member_ids))
+            conn.execute(f"UPDATE members SET synced_at = datetime('now') WHERE id IN ({placeholders})", member_ids)
+            conn.commit()
+        finally:
+            conn.close()
+
     def insert_speech(self, bank_code, speaker, title, date, url, full_text=None, speech_type='speech', language='en'):
         """새 연설 삽입 및 위원의 마지막 연설일 갱신"""
         speaker_id = self.get_or_create_member(bank_code, speaker)
@@ -301,9 +372,67 @@ class SpeechDB:
         conn = self._get_conn()
         try:
             if exact_date:
-                conn.execute("UPDATE speeches SET full_text = ?, date = ? WHERE id = ?", (full_text, exact_date, speech_id))
+                conn.execute("UPDATE speeches SET full_text = ?, date = ?, synced_at = NULL WHERE id = ?", (full_text, exact_date, speech_id))
             else:
-                conn.execute("UPDATE speeches SET full_text = ? WHERE id = ?", (full_text, speech_id))
+                conn.execute("UPDATE speeches SET full_text = ?, synced_at = NULL WHERE id = ?", (full_text, speech_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_unsynced_speeches(self, limit=100):
+        """동기화되지 않은 연설 데이터 조회"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT s.*, m.name as speaker, ar.stance_score, ar.stance_reason, ar.keywords, ar.main_risk
+                FROM speeches s
+                LEFT JOIN members m ON s.speaker_id = m.id
+                LEFT JOIN analysis_results ar ON s.id = ar.speech_id
+                WHERE s.synced_at IS NULL
+                ORDER BY s.date DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_as_synced(self, speech_ids):
+        """연설 데이터를 동기화 완료로 표시"""
+        if not speech_ids:
+            return
+        conn = self._get_conn()
+        try:
+            placeholders = ', '.join(['?'] * len(speech_ids))
+            conn.execute(f"UPDATE speeches SET synced_at = datetime('now') WHERE id IN ({placeholders})", speech_ids)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_unsynced_analysis(self, limit=100):
+        """동기화되지 않은 분석 결과 조회"""
+        conn = self._get_conn()
+        try:
+            # speeches.url을 외래키 대신 사용하여 PostgreSQL에서 매칭
+            rows = conn.execute("""
+                SELECT s.url, ar.*
+                FROM analysis_results ar
+                JOIN speeches s ON ar.speech_id = s.id
+                WHERE ar.synced_at IS NULL
+                AND ar.analysis_status IN ('scored', 'no_signal')
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_analysis_as_synced(self, speech_ids):
+        """분석 결과를 동기화 완료로 표시"""
+        if not speech_ids:
+            return
+        conn = self._get_conn()
+        try:
+            placeholders = ', '.join(['?'] * len(speech_ids))
+            conn.execute(f"UPDATE analysis_results SET synced_at = datetime('now') WHERE speech_id IN ({placeholders})", speech_ids)
             conn.commit()
         finally:
             conn.close()
@@ -339,11 +468,12 @@ class SpeechDB:
             stats = {}
             # Count per bank
             rows = conn.execute("""
-                SELECT bank_code, 
-                       COUNT(*) as total,
-                       SUM(CASE WHEN full_text IS NOT NULL AND length(full_text) > 500 THEN 1 ELSE 0 END) as analyzed
-                FROM speeches 
-                GROUP BY bank_code
+                SELECT s.bank_code, 
+                       COUNT(s.id) as total,
+                       SUM(CASE WHEN ar.analysis_status IN ('scored', 'no_signal') THEN 1 ELSE 0 END) as analyzed
+                FROM speeches s
+                LEFT JOIN analysis_results ar ON s.id = ar.speech_id
+                GROUP BY s.bank_code
             """).fetchall()
             
             for r in rows:
@@ -373,16 +503,18 @@ class SpeechDB:
                 SELECT DISTINCT m.id 
                 FROM members m
                 JOIN speeches s ON m.id = s.speaker_id
-                WHERE s.stance_score IS NOT NULL
+                JOIN analysis_results ar ON s.id = ar.speech_id
+                WHERE ar.stance_score IS NOT NULL
             """).fetchall()
             
             for m in members:
                 member_id = m['id']
                 speeches = conn.execute("""
-                    SELECT stance_score, date
-                    FROM speeches 
-                    WHERE speaker_id = ? AND stance_score IS NOT NULL
-                    ORDER BY date DESC
+                    SELECT ar.stance_score, s.date
+                    FROM speeches s
+                    JOIN analysis_results ar ON s.id = ar.speech_id
+                    WHERE s.speaker_id = ? AND ar.stance_score IS NOT NULL
+                    ORDER BY s.date DESC
                 """, (member_id,)).fetchall()
                 
                 total_weight = 0.0
@@ -411,7 +543,7 @@ class SpeechDB:
                 
                 if total_weight > 0:
                     avg_score = total_score / total_weight
-                    conn.execute("UPDATE members SET avg_stance_score = ? WHERE id = ?", (avg_score, member_id))
+                    conn.execute("UPDATE members SET avg_stance_score = ?, synced_at = NULL WHERE id = ?", (avg_score, member_id))
             
             conn.commit()
         finally:

@@ -19,29 +19,33 @@ class FRBScraper(BaseScraper):
     BANK_NAME = 'Federal Reserve'
     BASE_URL = 'https://www.federalreserve.gov'
     
-    SPEAKER_MAP = {
-        'Barr': 'Michael S. Barr',
-        'Bowman': 'Michelle W. Bowman',
-        'Brainard': 'Lael Brainard',
-        'Clarida': 'Richard H. Clarida',
-        'Cook': 'Lisa D. Cook',
-        'Jefferson': 'Philip N. Jefferson',
-        'Kugler': 'Adriana D. Kugler',
-        'Miran': 'Stephen I. Miran',
-        'Powell': 'Jerome H. Powell',
-        'Quarles': 'Randal K. Quarles',
-        'Waller': 'Christopher J. Waller',
-        'Yellen': 'Janet L. Yellen',
-        'Bernanke': 'Ben S. Bernanke',
-        'Tarullo': 'Daniel K. Tarullo',
-    }
-
     def _get_year_url(self, year):
         """Get the correct URL for a given year's speech list."""
         if year >= 2011:
             return f"{self.BASE_URL}/newsevents/{year}-speeches.htm"
         else:
             return f"{self.BASE_URL}/newsevents/{year}speech.htm"
+
+    def _lookup_speaker(self, last_name):
+        """Dynamic speaker lookup in the DB based on last name."""
+        if not last_name:
+            return None
+            
+        conn = self.db._get_conn()
+        try:
+            # Look for active members in FRB whose name ends with the provided last name
+            # or matches common patterns.
+            row = conn.execute("""
+                SELECT name FROM members 
+                WHERE bank_code = 'FRB' 
+                AND (name LIKE ? OR name LIKE ?)
+                ORDER BY status='active' DESC, last_speech_date DESC
+                LIMIT 1
+            """, (f"% {last_name}", f"{last_name}%")).fetchone()
+            
+            return row['name'] if row else last_name
+        finally:
+            conn.close()
 
     def fetch_speech_list(self, year=None):
         """Fetch list of Fed speeches for a given year."""
@@ -92,7 +96,8 @@ class FRBScraper(BaseScraper):
             speaker = None
             speaker_match = re.search(r'/speech/([a-z]+)\d{8}', href)
             if speaker_match:
-                speaker = speaker_match.group(1).title()
+                speaker_slug = speaker_match.group(1).title()
+                speaker = self._lookup_speaker(speaker_slug)
 
             # Try to extract from surrounding text (date/speaker in parent)
             parent = link.parent
@@ -105,9 +110,6 @@ class FRBScraper(BaseScraper):
                     if m:
                         speaker = m.group(1)
                         break
-
-            if speaker and speaker in self.SPEAKER_MAP:
-                speaker = self.SPEAKER_MAP[speaker]
 
             speeches.append({
                 'title': title,

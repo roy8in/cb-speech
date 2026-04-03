@@ -15,10 +15,13 @@ class Config:
     # 모듈별 경로
     SPEECH_DB_PATH = DATA_DIR / "speech_tracker" / "speeches.db"
     DOCS_DIR = ROOT_DIR / "docs"
-    SPEECH_DASHBOARD_PATH = DOCS_DIR / "speech_tracker" / "data.json"
     
     # LLM 설정
     SPEECH_API_KEY = os.getenv("GOOGLE_API_KEY_FREE_TIER") or os.getenv("GOOGLE_API_KEY")
     DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-    
+
+    # PostgreSQL 설정
+    POSTGRE_API_URL = os.getenv("POSTGRE_API_URL")
+    POSTGRE_API_KEY = os.getenv("POSTGRE_API_KEY")
+
 config = Config()

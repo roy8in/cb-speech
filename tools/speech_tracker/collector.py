@@ -11,7 +11,6 @@ import argparse
 import logging
 from datetime import datetime
 from pathlib import Path
-import requests
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -19,27 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.config import config
 from tools.speech_tracker.models import SpeechDB
 from tools.speech_tracker.scrapers import ALL_SCRAPERS
+from tools.speech_tracker.exporter import PostgreExporter
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-def send_error_alert(bank_code: str, error_msg: str):
-    """Sends a synchronous Telegram alert when a scraper fails."""
-    if not config.TELEGRAM_API_URL or not config.ALLOWED_TELEGRAM_USER_IDS:
-        return
-    text = f"🚨 *Speech Tracker Error*\n\nScraper failed for: *{bank_code}*\nError: `{error_msg}`"
-    try:
-        for chat_id in config.ALLOWED_TELEGRAM_USER_IDS:
-            requests.post(
-                f"{config.TELEGRAM_API_URL}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-                timeout=10
-            )
-    except Exception as e:
-        logger.error(f"Failed to send Telegram error alert: {e}")
 
 def run_collection(banks=None, mode='recent', analyze=True, start_year=None):
     """
@@ -53,10 +38,13 @@ def run_collection(banks=None, mode='recent', analyze=True, start_year=None):
     """
     db = SpeechDB()
     target_banks = banks or list(ALL_SCRAPERS.keys())
-
+    
+    started_at = datetime.now().isoformat()
     total_new = 0
     total_refreshed = 0
     results = {}
+    error_msg = None
+    status = 'success'
 
     for bank_code in target_banks:
         if bank_code not in ALL_SCRAPERS:
@@ -92,8 +80,9 @@ def run_collection(banks=None, mode='recent', analyze=True, start_year=None):
 
         except Exception as e:
             logger.error(f"[{bank_code}] Pipeline failed: {e}")
-            send_error_alert(bank_code, str(e))
             results[bank_code] = -1
+            error_msg = str(e)
+            status = 'partial' if total_new > 0 else 'failed'
             
     # 3. Apply activity-based member status cleanup globally after collection
     try:
@@ -115,25 +104,39 @@ def run_collection(banks=None, mode='recent', analyze=True, start_year=None):
         except Exception as e:
             logger.error(f"Analysis failed: {e}")
 
+    # 4. Sync with PostgreSQL
+    try:
+        logger.info("Syncing new speeches with PostgreSQL...")
+        exporter = PostgreExporter(db=db)
+        synced_count = exporter.upload_new_speeches()
+        logger.info(f"Synced {synced_count} speeches to PostgreSQL")
+    except Exception as e:
+        logger.error(f"PostgreSQL sync failed: {e}")
+
+    finished_at = datetime.now().isoformat()
+    
+    # Log results to DB
+    try:
+        db.log_collection_result(
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            bank_stats=results,
+            total_new=total_new,
+            error_msg=error_msg
+        )
+    except Exception as e:
+        logger.error(f"Failed to save collection log to DB: {e}")
+
     # Print summary
     logger.info(f"\n{'='*50}")
     logger.info(f"COLLECTION SUMMARY — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     logger.info(f"{'='*50}")
     for bank, count in results.items():
-        status = f"{count} new" if count >= 0 else "FAILED"
-        logger.info(f"  {bank}: {status}")
+        status_str = f"{count} new" if count >= 0 else "FAILED"
+        logger.info(f"  {bank}: {status_str}")
     logger.info(f"  Total new: {total_new}")
     logger.info(f"  Total refreshed: {total_refreshed}")
-
-    # Print overall stats
-    stats = db.get_stats()
-    logger.info(f"\nDatabase totals:")
-    for bank in sorted(stats.keys()):
-        if bank == 'total':
-            continue
-        s = stats[bank]
-        logger.info(f"  {bank}: {s['total_speeches']} speeches ({s['analyzed']} analyzed)")
-    logger.info(f"  Grand total: {stats['total']} speeches")
 
     return results
 
@@ -151,6 +154,8 @@ def main():
                         help='Skip NLP analysis')
     parser.add_argument('--stats', action='store_true',
                         help='Show database stats and exit')
+    parser.add_argument('--sync-only', action='store_true',
+                        help='Only sync unsynced speeches to PostgreSQL and exit')
     parser.add_argument('--test', action='store_true',
                         help='Test mode: fetch 1 speech from each bank')
 
@@ -168,6 +173,14 @@ def main():
             s = stats[bank]
             print(f"  {bank}: {s['total_speeches']} speeches ({s['analyzed']} analyzed)")
         print(f"  Total: {stats['total']} speeches")
+        return
+
+    if args.sync_only:
+        db = SpeechDB()
+        print("Starting PostgreSQL sync...")
+        exporter = PostgreExporter(db=db)
+        count = exporter.upload_new_speeches(limit=1000)
+        print(f"Successfully synced {count} speeches to PostgreSQL")
         return
 
     if args.test:

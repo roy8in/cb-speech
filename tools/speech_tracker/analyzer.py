@@ -135,10 +135,10 @@ class HawkDoveAnalyzer:
             logger.error(f"LLM analysis failed: {e}")
             return None
 
-    def _analyze_and_update(self, speech_id: int, title: str, text: str, date: str, speaker: str) -> bool:
+    def _analyze_and_update(self, speech_id: int, bank_code: str, title: str, text: str, date: str, speaker: str) -> bool:
         """Analyzes a single speech and updates the database using a fresh connection."""
         import time
-        logger.info(f"Analyzing speech [{speech_id}]: {title[:50]}...")
+        logger.info(f"Analyzing speech [{bank_code}] [{speech_id}]: {title[:50]}... ({speaker})")
         result = self.analyze_text(text, date=date, speaker=speaker)
 
         conn = self.db._get_conn()
@@ -146,19 +146,34 @@ class HawkDoveAnalyzer:
             if result:
                 status = 'scored' if result.get('stance_score') is not None else 'no_signal'
                 conn.execute("""
-                    UPDATE speeches 
-                    SET stance_score = ?, stance_reason = ?, keywords = ?, main_risk = ?, 
+                    INSERT INTO analysis_results 
+                    (speech_id, stance_score, stance_reason, keywords, main_risk, analysis_attempts, analysis_status, analyzed_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, datetime('now'))
+                    ON CONFLICT(speech_id) DO UPDATE SET
+                        stance_score = excluded.stance_score,
+                        stance_reason = excluded.stance_reason,
+                        keywords = excluded.keywords,
+                        main_risk = excluded.main_risk,
                         analysis_attempts = analysis_attempts + 1,
-                        analysis_status = ?
-                    WHERE id = ?
-                """, (result['stance_score'], result['stance_reason'], json.dumps(result['keywords']), 
-                      result['main_risk'], status, speech_id))
+                        analysis_status = excluded.analysis_status,
+                        analyzed_at = excluded.analyzed_at
+                """, (speech_id, result['stance_score'], result['stance_reason'], json.dumps(result['keywords']), 
+                      result['main_risk'], status))
+                
+                # Mark speech for re-sync
+                conn.execute("UPDATE speeches SET synced_at = NULL WHERE id = ?", (speech_id,))
+                
                 conn.commit()
-                logger.info(f"  -> [{speech_id}] Status: {status}, Score: {result['stance_score']}")
+                logger.info(f"  -> [{bank_code}] [{speech_id}] Status: {status}, Score: {result['stance_score']}")
             else:
-                conn.execute("UPDATE speeches SET analysis_attempts = analysis_attempts + 1 WHERE id = ?", (speech_id,))
+                conn.execute("""
+                    INSERT INTO analysis_results (speech_id, analysis_attempts, analysis_status)
+                    VALUES (?, 1, 'pending')
+                    ON CONFLICT(speech_id) DO UPDATE SET
+                        analysis_attempts = analysis_attempts + 1
+                """, (speech_id,))
                 conn.commit()
-                logger.warning(f"  -> [{speech_id}] Analysis failed. Attempt logged.")
+                logger.warning(f"  -> [{bank_code}] [{speech_id}] Analysis failed. Attempt logged.")
             
             # Add delay to avoid hitting Google API free tier rate limits (RPM)
             time.sleep(2)
@@ -172,17 +187,22 @@ class HawkDoveAnalyzer:
         conn = self.db._get_conn()
         try:
             # Mark speeches that are too short to analyze meaningfully or missing text
+            # We need to join or check existence in analysis_results
             cursor = conn.execute("""
-                UPDATE speeches 
-                SET analysis_attempts = 1, 
+                INSERT INTO analysis_results (speech_id, analysis_attempts, analysis_status, stance_reason, keywords)
+                SELECT s.id, 1, 'skipped', 
+                    CASE WHEN s.full_text IS NULL THEN 'Skipped: Missing full text.'
+                         ELSE 'Skipped: Text too short for meaningful analysis (<= 500 chars).' END,
+                    '[]'
+                FROM speeches s
+                LEFT JOIN analysis_results ar ON s.id = ar.speech_id
+                WHERE (s.full_text IS NULL OR length(s.full_text) <= 500)
+                AND (ar.analysis_status IS NULL OR ar.analysis_status = 'pending')
+                ON CONFLICT(speech_id) DO UPDATE SET
+                    analysis_attempts = 1,
                     analysis_status = 'skipped',
-                    stance_reason = CASE 
-                        WHEN full_text IS NULL THEN 'Skipped: Missing full text.'
-                        ELSE 'Skipped: Text too short for meaningful analysis (<= 500 chars).'
-                    END,
+                    stance_reason = excluded.stance_reason,
                     keywords = '[]'
-                WHERE (full_text IS NULL OR length(full_text) <= 500)
-                AND analysis_status = 'pending'
             """)
             conn.commit()
             count = cursor.rowcount
@@ -202,15 +222,16 @@ class HawkDoveAnalyzer:
 
         conn = self.db._get_conn()
         try:
-            # Fetch speeches that are still in 'pending' status
+            # Fetch speeches that are still in 'pending' status or not yet attempted
             rows = conn.execute(f"""
-                SELECT s.id, s.title, s.full_text, s.date, m.name as speaker
+                SELECT s.id, s.bank_code, s.title, s.full_text, s.date, m.name as speaker
                 FROM speeches s
                 LEFT JOIN members m ON s.speaker_id = m.id
+                LEFT JOIN analysis_results ar ON s.id = ar.speech_id
                 WHERE s.full_text IS NOT NULL 
                 AND length(s.full_text) > 500
-                AND s.analysis_status = 'pending'
-                AND s.analysis_attempts < 3
+                AND (ar.analysis_status IS NULL OR ar.analysis_status = 'pending')
+                AND (ar.analysis_attempts IS NULL OR ar.analysis_attempts < 3)
                 LIMIT {limit}
             """).fetchall()
         finally:
@@ -227,28 +248,7 @@ class HawkDoveAnalyzer:
             future_to_speech = {
                 executor.submit(
                     self._analyze_and_update,
-                    row['id'], row['title'], row['full_text'], row['date'], row['speaker'] or "Unknown"
-                ): row['id'] for row in rows
-            }
-
-            for future in concurrent.futures.as_completed(future_to_speech):
-                try:
-                    if future.result():
-                        analyzed_count += 1
-                except Exception as e:
-                    logger.error(f"Worker thread failed: {e}")
-
-        logger.info(f"Parallel analysis complete. Successfully analyzed {analyzed_count}/{total_to_process} speeches.")
-        return analyzed_count
-
-s={max_workers})...")
-
-        analyzed_count = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_speech = {
-                executor.submit(
-                    self._analyze_and_update,
-                    row['id'], row['title'], row['full_text'], row['date'], row['speaker'] or "Unknown"
+                    row['id'], row['bank_code'], row['title'], row['full_text'], row['date'], row['speaker'] or "Unknown"
                 ): row['id'] for row in rows
             }
 
