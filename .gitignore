@@ -1,0 +1,10 @@
+.env
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.db
+data/speech_tracker/*.db*
+data/speech_tracker/*.sqlite
+docs/speech_tracker/data.json

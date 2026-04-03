@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CB Speech Tracker | Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-color: #0f1117;
+            --card-bg: #1a1d27;
+            --border-color: #2d333f;
+            --text-main: #e2e8f0;
+            --text-dim: #94a3b8;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background-color: var(--bg-color); 
+            color: var(--text-main);
+            font-family: "Pretendard", -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
+            line-height: 1.5;
+            padding: 2rem;
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .logo { font-size: 1.25rem; font-weight: 800; letter-spacing: -0.02em; }
+        .logo span { color: var(--accent-blue); }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 0.8rem;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            background: rgba(255,255,255,0.05);
+        }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; }
+        .status-success { color: var(--accent-green); }
+        .status-success .status-dot { background-color: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+        .status-failed { color: var(--accent-red); }
+        .status-failed .status-dot { background-color: var(--accent-red); }
+
+        .grid-stats {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 0.75rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            padding: 1rem 0.5rem;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            text-align: center;
+        }
+        .stat-label { color: var(--text-dim); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; margin-bottom: 0.25rem; }
+        .stat-value { font-size: 1.25rem; font-weight: 800; color: var(--text-main); }
+
+        section {
+            background: var(--card-bg);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        h2 { font-size: 1rem; margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+
+        .data-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        .data-table th { text-align: left; padding: 0.75rem; color: var(--text-dim); border-bottom: 1px solid var(--border-color); font-weight: 600; }
+        .data-table td { padding: 0.75rem; border-bottom: 1px solid var(--border-color); vertical-align: top; }
+        
+        /* 날짜 컬럼 고정 및 줄바꿈 방지 */
+        .col-date { white-space: nowrap; min-width: 100px; width: 110px; text-align: right !important; }
+        
+        .bank-badge {
+            font-size: 0.7rem;
+            padding: 3px 8px;
+            border-radius: 6px;
+            background: rgba(59, 130, 246, 0.15);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            color: var(--text-main);
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .speech-link { color: var(--text-main); text-decoration: none; font-weight: 500; display: block; line-height: 1.4; }
+        .speech-link:hover { color: var(--accent-blue); text-decoration: underline; }
+
+        footer { text-align: center; color: var(--text-dim); font-size: 0.7rem; margin-top: 2rem; }
+
+        select {
+            background: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 0.5rem;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            outline: none;
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 300px;
+            width: 100%;
+        }
+
+        @media (max-width: 1000px) {
+            .grid-stats { grid-template-columns: repeat(4, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .grid-stats { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">CB <span>SPEECH</span> TRACKER</div>
+            <div id="health-status" class="status-badge">
+                <div class="status-dot"></div>
+                <span id="status-text">Loading...</span>
+            </div>
+        </header>
+
+        <div class="grid-stats" id="bank-stats-grid"></div>
+        
+        <section>
+            <h2>
+                <span>📈 Speech Frequency over Time</span>
+                <select id="bank-selector">
+                    <option value="ALL">All Banks</option>
+                    <option value="FRB">FRB 🇺🇸</option>
+                    <option value="ECB">ECB 🇪🇺</option>
+                    <option value="BOE">BOE 🇬🇧</option>
+                    <option value="BOJ">BOJ 🇯🇵</option>
+                    <option value="RBA">RBA 🇦🇺</option>
+                    <option value="BOC">BOC 🇨🇦</option>
+                </select>
+            </h2>
+            <div class="chart-container">
+                <canvas id="speechChart"></canvas>
+            </div>
+        </section>
+
+        <section>
+            <h2>📋 Recent Collection Logs</h2>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Status</th>
+                        <th>New Items</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="log-body"></tbody>
+            </table>
+        </section>
+
+        <section>
+            <h2>🎙️ Recent Speeches (Last 14 Days)</h2>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th style="width: 100px;">Bank</th>
+                        <th style="width: 150px;">Speaker</th>
+                        <th>Title</th>
+                        <th class="col-date">Date</th>
+                    </tr>
+                </thead>
+                <tbody id="speech-body"></tbody>
+            </table>
+        </section>
+
+        <footer>
+            Last Sync: <span id="last-updated">-</span>
+        </footer>
+    </div>
+
+    <script>
+        const BANK_FLAGS = {
+            'FRB': '🇺🇸',
+            'ECB': '🇪🇺',
+            'BOE': '🇬🇧',
+            'BOJ': '🇯🇵',
+            'RBA': '🇦🇺',
+            'BOC': '🇨🇦'
+        };
+
+        const BANK_COLORS = {
+            'FRB': '#3b82f6', // Blue
+            'ECB': '#f59e0b', // Yellow
+            'BOE': '#ef4444', // Red
+            'BOJ': '#10b981', // Green
+            'RBA': '#8b5cf6', // Indigo
+            'BOC': '#ec4899', // Pink
+        };
+
+        let chartInstance = null;
+        let globalTimeData = null;
+
+        function updateChart(selectedBank) {
+            if (!globalTimeData) return;
+            
+            const ctx = document.getElementById('speechChart').getContext('2d');
+            
+            // Collect all unique months across all banks and sort them
+            let allMonths = new Set();
+            Object.values(globalTimeData).forEach(bankData => {
+                Object.keys(bankData).forEach(month => allMonths.add(month));
+            });
+            const labels = Array.from(allMonths).sort();
+            
+            let datasets = [];
+            
+            if (selectedBank === 'ALL') {
+                Object.entries(globalTimeData).forEach(([bank, data]) => {
+                    datasets.push({
+                        label: bank,
+                        data: labels.map(m => data[m] || 0),
+                        borderColor: BANK_COLORS[bank],
+                        backgroundColor: BANK_COLORS[bank] + '33',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.3,
+                        pointRadius: 1,
+                        pointHoverRadius: 5
+                    });
+                });
+            } else {
+                const data = globalTimeData[selectedBank] || {};
+                datasets.push({
+                    label: selectedBank,
+                    data: labels.map(m => data[m] || 0),
+                    borderColor: BANK_COLORS[selectedBank],
+                    backgroundColor: BANK_COLORS[selectedBank] + '33',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 2,
+                    pointHoverRadius: 6
+                });
+            }
+
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+
+            Chart.defaults.color = '#94a3b8';
+            chartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        legend: {
+                            display: selectedBank === 'ALL',
+                            position: 'top',
+                        },
+                        tooltip: {
+                            backgroundColor: '#1a1d27',
+                            titleColor: '#e2e8f0',
+                            bodyColor: '#e2e8f0',
+                            borderColor: '#2d333f',
+                            borderWidth: 1
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#2d333f', drawBorder: false },
+                            ticks: { maxTicksLimit: 12 }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: '#2d333f', drawBorder: false },
+                            ticks: { precision: 0 }
+                        }
+                    }
+                }
+            });
+        }
+
+        async function loadData() {
+            try {
+                const response = await fetch('data.json?t=' + Date.now());
+                const data = await response.json();
+
+                document.getElementById('status-text').innerText = data.health === 'success' ? 'Operational' : 'Issues';
+                document.getElementById('health-status').className = 'status-badge ' + (data.health === 'success' ? 'status-success' : 'status-failed');
+                document.getElementById('last-updated').innerText = new Date(data.last_updated).toLocaleString();
+
+                const statsGrid = document.getElementById('bank-stats-grid');
+                let statsHtml = `<div class="stat-card"><div class="stat-label">Total</div><div class="stat-value">${data.total_speeches.toLocaleString()}</div></div>`;
+                
+                ['FRB', 'ECB', 'BOE', 'BOJ', 'RBA', 'BOC'].forEach(bank => {
+                    const count = data.bank_stats[bank] || 0;
+                    statsHtml += `<div class="stat-card">
+                        <div class="stat-label">${BANK_FLAGS[bank] || ''} ${bank}</div>
+                        <div class="stat-value">${count.toLocaleString()}</div>
+                    </div>`;
+                });
+                statsGrid.innerHTML = statsHtml;
+
+                // Handle Time Series Data
+                globalTimeData = data.time_series_data;
+                const selector = document.getElementById('bank-selector');
+                updateChart(selector.value);
+                selector.onchange = (e) => updateChart(e.target.value);
+
+                document.getElementById('log-body').innerHTML = data.recent_logs.map(log => `
+                    <tr>
+                        <td>${new Date(log.started_at).toLocaleDateString()}</td>
+                        <td style="color: ${log.status === 'success' ? 'var(--accent-green)' : 'var(--accent-red)'}">${log.status.toUpperCase()}</td>
+                        <td>+${log.total_new}</td>
+                        <td style="font-size: 0.7rem; color: var(--text-dim);">${log.error || 'Normal'}</td>
+                    </tr>
+                `).join('');
+
+                const speechBody = document.getElementById('speech-body');
+                if (data.recent_speeches && data.recent_speeches.length > 0) {
+                    speechBody.innerHTML = data.recent_speeches.map(s => `
+                        <tr>
+                            <td><span class="bank-badge">${BANK_FLAGS[s.bank] || ''} ${s.bank}</span></td>
+                            <td style="font-weight: 600; color: ${s.speaker ? 'var(--text-main)' : 'var(--text-dim)'};">
+                                ${s.speaker || 'Central Bank'}
+                            </td>
+                            <td><a href="${s.url}" target="_blank" class="speech-link">${s.title}</a></td>
+                            <td class="col-date">${s.date}</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    speechBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-dim); padding: 2rem;">No recent speeches found.</td></tr>';
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+        
+        loadData();
+        setInterval(loadData, 300000);
+    </script>
+</body>
+</html>
