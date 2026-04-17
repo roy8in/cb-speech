@@ -1,115 +1,138 @@
-"""
-Members 테이블 데이터 정리 스크립트
-1. 사람 이름이 아닌 쓰레기 데이터를 status='invalid'로 마킹
-2. 관련 speeches의 speaker_id를 올바른 멤버로 재연결 (가능한 경우)
-3. 임기 7일 미만의 의심스러운 term_start/term_end를 NULL로 초기화
-"""
+
+import sys
+import re
 import sqlite3
+from pathlib import Path
 
-DB_PATH = "data/speeches.db"
-
-# 1. 명확히 사람 이름이 아닌 entries (수동 확인 후 확정 목록)
-INVALID_MEMBER_IDS = [
-    # BOC
-    1,    # 'Export Development' — 기관명
-    # BOE — 연설 제목, 슬라이드, 트랜스크립트 등
-    330,  # 'Achieving a sustainable recovery'
-    100,  # 'Anil Kashyap slides'
-    84,   # 'Central clearing'
-    346,  # 'Charlotte Gerken accompanying slides'
-    336,  # 'Dave Ramsden slides'
-    345,  # 'Jonathan Haskel accompanying slides'
-    342,  # 'Jonathan Haskel slides'
-    331,  # 'Mark Carney Press Conference transcript'
-    332,  # 'Mark Carney Q&A transcript'
-    335,  # 'Mark Carney presentation slides'
-    334,  # 'Mark Carney slides'
-    333,  # 'Mark Carney transcript'
-    350,  # 'Megan Greene transcript'
-    337,  # 'Policy Panel'
-    98,   # 'Pull, push, pipes'
-    79,   # 'Running out of room'
-    343,  # 'Silvana Tenreyro accompanying slides'
-    347,  # 'Speech annex'
-    99,   # 'Stress tests'
-    341,  # 'Victoria Cleland: Annex 1'
-    # BOJ
-    117,  # 'Keynote Speech'
-    123,  # '日本語' — 언어 태그
-    # RBA
-    169,  # 'Assistant  (Financial System)' — 직급
-]
-
-# 2. 슬라이드/트랜스크립트 멤버의 speeches를 원래 화자에게 재연결
-# { invalid_member_id: correct_member_name }
-REMAP_SPEAKERS = {
-    334: 'Mark Carney',       # 'Mark Carney slides' -> Mark Carney
-    335: 'Mark Carney',       # 'Mark Carney presentation slides' -> Mark Carney
-    331: 'Mark Carney',       # 'Mark Carney Press Conference transcript' -> Mark Carney
-    332: 'Mark Carney',       # 'Mark Carney Q&A transcript' -> Mark Carney
-    333: 'Mark Carney',       # 'Mark Carney transcript' -> Mark Carney
-    336: 'Dave Ramsden',      # 'Dave Ramsden slides' -> Dave Ramsden
-    346: 'Charlotte Gerken',  # 'Charlotte Gerken accompanying slides' -> Charlotte Gerken
-    345: 'Jonathan Haskel',   # 'Jonathan Haskel accompanying slides' -> Jonathan Haskel
-    342: 'Jonathan Haskel',   # 'Jonathan Haskel slides' -> Jonathan Haskel
-    343: 'Silvana Tenreyro',  # 'Silvana Tenreyro accompanying slides' -> Silvana Tenreyro
-    350: 'Megan Greene',      # 'Megan Greene transcript' -> Megan Greene
-    341: 'Victoria Cleland',  # 'Victoria Cleland: Annex 1' -> Victoria Cleland
-}
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from tools.speech_tracker.models import SpeechDB
 
 def clean_members():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    db = SpeechDB()
+    conn = db._get_conn()
     
-    print("=== Members 테이블 데이터 정리 ===\n")
+    # 1. Get all members
+    members = conn.execute("SELECT id, bank_code, name FROM members").fetchall()
     
-    # Step 1: Remap speeches from invalid slide/transcript members to real members
-    remapped = 0
-    for invalid_id, correct_name in REMAP_SPEAKERS.items():
-        # Find the correct member's id
-        row = conn.execute("SELECT id FROM members WHERE name = ? AND bank_code = 'BOE'", (correct_name,)).fetchone()
-        if row:
-            correct_id = row['id']
-            count = conn.execute("UPDATE speeches SET speaker_id = ? WHERE speaker_id = ?", (correct_id, invalid_id)).rowcount
-            remapped += count
-            if count > 0:
-                print(f"  ✅ Remapped {count} speech(es): '{correct_name} slides/transcript' -> '{correct_name}' (id={correct_id})")
-    
-    print(f"\n  총 {remapped}개 연설문 재연결 완료.\n")
-    
-    # Step 2: Mark invalid members
-    invalid_count = 0
-    for mid in INVALID_MEMBER_IDS:
-        row = conn.execute("SELECT name FROM members WHERE id = ?", (mid,)).fetchone()
-        if row:
-            conn.execute("UPDATE members SET status = 'invalid' WHERE id = ?", (mid,))
-            invalid_count += 1
-            print(f"  🚫 Invalid: id={mid} name='{row['name']}'")
-    
-    print(f"\n  총 {invalid_count}개 멤버를 'invalid'로 마킹 완료.\n")
-    
-    # Step 3: Reset suspicious terms (< 7 days) to NULL
-    result = conn.execute("""
-        UPDATE members 
-        SET term_start = NULL, term_end = NULL
-        WHERE term_start IS NOT NULL 
-        AND term_end IS NOT NULL
-        AND julianday(term_end) - julianday(term_start) < 7
-        AND status != 'invalid'
-    """)
-    print(f"  🔄 임기 7일 미만 의심 데이터 {result.rowcount}건의 term_start/term_end를 NULL로 초기화.\n")
-    
+    blacklist = [
+        'slides', 'transcript', 'appendix', 'annex', 'foreword', 'lead comment', 
+        'comments on', 'comments given by', 'press conference', 'presentation',
+        'technical appendix', 'accompanying slides', 'available as', 'accessible fx',
+        'achieving a sustainable', 'an evolving', 'finding the right', 'five years of',
+        'from design to', 'global action', 'inclusive capitalism', 'inflation persistence',
+        'investment association', 'looking through', 'macroprudential policy',
+        'measuring recession', 'one bank research', 'protecting economic',
+        'prudential regulation', 'pull, push, pipes', 'returning inflation',
+        'running out of room', 'speaker requests', 'speech annex', 'stress tests',
+        'tails of the unexpected', 'the future of work', 'the grand unifying',
+        'update and outlook', 'wwhy ssttaggffllaattiioonn', 'aiming at', 'article contributed',
+        'at the turning point', 'cashless payment', 'digital innovation', 'germany and japan',
+        'how to overcome', 'keynote speech', 'list by year', 'overcoming deflation',
+        'path toward', 'realizing the asian', 'revisiting qqe', 'the future of money',
+        'toward overcoming', 'two years under', '日本語', 'assistant (financial system)',
+        'the australian', 'interest rate benchmarks', 'renminbi internationalisation',
+        'buffers and options', 'inflation and monetary policy', 'an accounting',
+        'resilience and ongoing', 'after the boom', 'the long run', 'fundamentals and flexibility',
+        'international and domestic', 'issues in economic', 'managing two transitions',
+        'building on strong', 'economic possibilities', 'issues in payments', 'the economic scene',
+        'challenges for economic', 'economic update', 'economic conditions', 'the economic outlook',
+        'anniversary event', 'light is therefore colour', 'for immediate release', 'speech by',
+        'remarks by', 'lecture by', 'address by', 'keynote by'
+    ]
+
+    # Pre-compiled regex for normalization
+    title_regex = re.compile(r'^(Sir|Dame|Professor|Dr\.|Governor|Deputy Governor|Assistant Governor|Executive Director)\s+', re.I)
+
+    # Dictionary to store canonical names: (bank_code, normalized_name) -> member_id
+    canonical_members = {}
+    # Dictionary to map old IDs to new IDs
+    id_map = {}
+    # IDs to delete
+    to_delete = []
+
+    print(f"Processing {len(members)} members...")
+
+    # First pass: identify normalization and merges
+    for m in members:
+        m_id = m['id']
+        bank_code = m['bank_code']
+        original_name = m['name']
+        
+        # Check blacklist
+        lower_name = original_name.lower()
+        if any(item in lower_name for item in blacklist) or len(original_name) < 3:
+            print(f"Blacklisting: {original_name}")
+            to_delete.append(m_id)
+            continue
+            
+        # Normalize name
+        name = original_name.strip()
+        name = title_regex.sub('', name)
+        
+        # Bank-specific normalization
+        if bank_code == 'BOJ':
+            parts = name.split()
+            if len(parts) == 2:
+                if parts[0].isupper() and not parts[1].isupper():
+                    name = f"{parts[1]} {parts[0].capitalize()}"
+                elif parts[1].isupper() and not parts[0].isupper():
+                    name = f"{parts[0]} {parts[1].capitalize()}"
+                else:
+                    name = " ".join([p.capitalize() for p in parts])
+        elif bank_code == 'BOE':
+            if name == "Andy Haldane" or name == "Andrew G Haldane": name = "Andrew Haldane"
+            elif name == "Charlie Bean": name = "Charles Bean"
+            elif name == "Andrew Sentence": name = "Andrew Sentance"
+            elif name == "Silvan Tenreyro": name = "Silvana Tenreyro"
+            elif name == "PPaauull FFiisshheerr": name = "Paul Fisher"
+            elif name == "MARK CARNEY": name = "Mark Carney"
+            elif name == "MERVYN KING": name = "Mervyn King"
+            elif name == "PAUL TUCKER": name = "Paul Tucker"
+            name = re.sub(r'\s*\(\w+\s+\d{4}\)', '', name)
+            name = re.sub(r'\s+slides$', '', name, flags=re.I)
+            
+        name = " ".join([p.capitalize() for p in name.split()])
+        
+        key = (bank_code, name)
+        if key in canonical_members:
+            winner_id = canonical_members[key]
+            id_map[m_id] = winner_id
+            to_delete.append(m_id)
+            print(f"Merging: '{original_name}' -> '{name}'")
+        else:
+            canonical_members[key] = m_id
+            if name != original_name:
+                print(f"To Normalize: '{original_name}' -> '{name}'")
+                # We can't update yet because of unique constraints
+                # We'll handle this in a second pass
+
+    # 2. Update speeches with merged IDs
+    print(f"Updating speeches with merged IDs...")
+    for old_id, new_id in id_map.items():
+        conn.execute("UPDATE speeches SET speaker_id = ? WHERE speaker_id = ?", (new_id, old_id))
+
+    # 3. Handle blacklisted members in speeches (set to NULL)
+    print(f"Nullifying speeches linked to blacklisted members...")
+    blacklisted_truly = [m_id for m_id in to_delete if m_id not in id_map]
+    if blacklisted_truly:
+        placeholders = ', '.join(['?'] * len(blacklisted_truly))
+        conn.execute(f"UPDATE speeches SET speaker_id = NULL WHERE speaker_id IN ({placeholders})", blacklisted_truly)
+
+    # 4. Delete bad/duplicate members
+    print(f"Deleting bad member records...")
+    if to_delete:
+        placeholders = ', '.join(['?'] * len(to_delete))
+        conn.execute(f"DELETE FROM members WHERE id IN ({placeholders})", to_delete)
+
+    # 5. Final pass: Update remaining names to normalized forms
+    print(f"Applying final name normalizations...")
+    for (bank_code, name), m_id in canonical_members.items():
+        conn.execute("UPDATE members SET name = ? WHERE id = ?", (name, m_id))
+
     conn.commit()
-    
-    # Summary
-    total_members = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
-    valid_members = conn.execute("SELECT COUNT(*) FROM members WHERE status != 'invalid'").fetchone()[0]
-    print(f"=== 정리 완료 ===")
-    print(f"  전체 멤버: {total_members}")
-    print(f"  유효 멤버: {valid_members}")
-    print(f"  무효(invalid): {total_members - valid_members}")
-    
     conn.close()
+    print("Cleanup complete.")
 
 if __name__ == "__main__":
     clean_members()

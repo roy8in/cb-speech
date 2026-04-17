@@ -26,6 +26,23 @@ class ECBScraper(BaseScraper):
         Fetch all ECB speeches from the CSV dataset.
         If year is specified, filter to that year.
         """
+        speeches = self._fetch_from_csv(year)
+        
+        # If looking for recent speeches, also check the HTML index
+        from datetime import datetime
+        current_year = datetime.now().year
+        if year is None or year >= current_year - 1:
+            recent_html = self.fetch_recent_from_html()
+            # Combine and deduplicate by URL/Logical key
+            existing_urls = {s['url'] for s in speeches}
+            for s in recent_html:
+                if s['url'] not in existing_urls:
+                    speeches.append(s)
+                    existing_urls.add(s['url'])
+        
+        return speeches
+
+    def _fetch_from_csv(self, year=None):
         resp = self._get(self.CSV_URL)
         if not resp:
             return []
@@ -37,7 +54,6 @@ class ECBScraper(BaseScraper):
         if not header:
             return []
 
-        # Expected columns: date|speakers|title|subtitle|contents
         speeches = []
         for row in reader:
             if len(row) < 3:
@@ -49,20 +65,13 @@ class ECBScraper(BaseScraper):
                 subtitle = row[3].strip() if len(row) > 3 else ''
                 contents = row[4].strip() if len(row) > 4 else ''
 
-                # Parse date
                 date = self._parse_ecb_date(date_str)
-                if not date:
-                    continue
+                if not date: continue
+                if year and not date.startswith(str(year)): continue
 
-                # Filter by year if specified
-                if year and not date.startswith(str(year)):
-                    continue
-
-                # Generate a unique URL (ECB CSV doesn't always have URLs)
-                # Use date + title hash as identifier
+                # Generate a unique URL for CSV entries
                 url_slug = re.sub(r'[^a-z0-9]+', '-', title.lower())[:60]
                 url = f"ecb://speeches/{date}/{url_slug}"
-
                 full_title = f"{title} - {subtitle}" if subtitle else title
 
                 speeches.append({
@@ -70,13 +79,66 @@ class ECBScraper(BaseScraper):
                     'date': date,
                     'url': url,
                     'speaker': speakers,
-                    '_full_text': contents,  # ECB CSV includes full text
+                    '_full_text': contents,
                 })
             except Exception as e:
                 logger.warning(f"[ECB] Error parsing CSV row: {e}")
                 continue
+        return speeches
 
-        logger.info(f"[ECB] Parsed {len(speeches)} speeches from CSV")
+    def fetch_recent_from_html(self):
+        """Fetch the most recent speeches from the ECB's RSS feed."""
+        url = "https://www.ecb.europa.eu/rss/press.html"
+        resp = self._get(url)
+        if not resp:
+            return []
+
+        speeches = []
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp.text)
+            
+            from datetime import datetime
+            for item in root.findall('.//item'):
+                link_node = item.find('link')
+                if link_node is None or not link_node.text: continue
+                href = link_node.text.strip()
+                
+                # ECB speeches and interviews
+                if '/press/key/' not in href and '/press/inter/' not in href:
+                    continue
+
+                title_node = item.find('title')
+                title = title_node.text.strip() if title_node is not None and title_node.text else ""
+                
+                pub_date_node = item.find('pubDate')
+                date = ""
+                if pub_date_node is not None and pub_date_node.text:
+                    pub_date = pub_date_node.text.strip()
+                    try:
+                        # Format: 'Thu, 16 Apr 2026 15:15:00 +0200'
+                        dt = datetime.strptime(pub_date[:-6].strip(), '%a, %d %b %Y %H:%M:%S')
+                        date = dt.strftime('%Y-%m-%d')
+                    except ValueError:
+                        pass
+
+                # Try to extract speaker from title
+                speaker = ""
+                if "Speech by" in title:
+                    speaker = title.split("Speech by")[-1].split(",")[0].strip()
+                elif "Interview with" in title:
+                    speaker = title.split("Interview with")[-1].split(",")[0].strip()
+
+                speeches.append({
+                    'title': title,
+                    'date': date,
+                    'url': href,
+                    'speaker': speaker,
+                })
+        except Exception as e:
+            logger.error(f"[ECB] Error parsing RSS feed: {e}")
+
+        logger.info(f"[ECB] Found {len(speeches)} speeches from RSS feed")
         return speeches
 
     def _parse_ecb_date(self, date_str):
@@ -100,6 +162,13 @@ class ECBScraper(BaseScraper):
         # For web-based fetching, try the ECB website
         if url.startswith('ecb://'):
             return None  # Text was already captured from CSV
+
+        # Check for PDF (often linked directly from RSS)
+        if url.lower().endswith('.pdf'):
+            resp = self._get(url)
+            if resp:
+                return self.extract_pdf_text(resp.content)
+            return None
 
         resp = self._get(url)
         if not resp:

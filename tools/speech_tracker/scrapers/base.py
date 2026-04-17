@@ -102,6 +102,26 @@ class BaseScraper(ABC):
             logger.error(f"[{self.BANK_CODE}] Failed to parse PDF: {e}")
             return "Error: Failed to extract text from this PDF document."
 
+    def _get_playwright(self, url, wait_ms=2000):
+        """Use Playwright to get page content, bypassing bot protection and dynamic loading."""
+        from playwright.sync_api import sync_playwright
+        import time
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=self.HEADERS['User-Agent'])
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until='networkidle', timeout=self.REQUEST_TIMEOUT * 1000)
+                if wait_ms > 0:
+                    time.sleep(wait_ms / 1000)
+                content = page.content()
+                return content
+            except Exception as e:
+                logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
+                return None
+            finally:
+                browser.close()
+
     @abstractmethod
     def fetch_speech_list(self, year=None):
         """

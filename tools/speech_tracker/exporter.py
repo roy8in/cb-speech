@@ -65,6 +65,9 @@ class PostgreExporter:
                 sql_type = 'DATE'
             elif 'score' in col_lower:
                 sql_type = 'REAL'
+            # ID 필드는 항상 BIGINT로 강제 (Tableau 연결 및 타입 일치 보장)
+            elif col_lower == 'id' or col_lower.endswith('_id'):
+                sql_type = 'BIGINT'
             elif pd.api.types.is_datetime64_any_dtype(dtype):
                 sql_type = 'TIMESTAMP'
             elif pd.api.types.is_integer_dtype(dtype):
@@ -72,9 +75,11 @@ class PostgreExporter:
             elif pd.api.types.is_float_dtype(dtype):
                 sql_type = 'DOUBLE PRECISION'
             
-            # Primary Key 설정 (url 또는 bank_code+name)
+            # Primary Key 설정
             pk = ""
-            if col_lower == 'url':
+            if col_lower == 'url' and not table_name.endswith("members"):
+                pk = " PRIMARY KEY"
+            elif col_lower == 'id' and table_name.endswith("members"):
                 pk = " PRIMARY KEY"
             
             columns_sql.append(f'"{col_name}" {sql_type}{pk}')
@@ -82,9 +87,11 @@ class PostgreExporter:
         # 복합 키 처리 (members 테이블용)
         extra_constraints = ""
         if table_name.endswith("members"):
-            extra_constraints = f', PRIMARY KEY ("bank_code", "name")'
-            # 개별 컬럼에서 PK 제거 (이미 추가된 경우 대비)
-            columns_sql = [c.replace(" PRIMARY KEY", "") for c in columns_sql]
+            if "id" not in [c.lower() for c in df.columns]:
+                extra_constraints = f', PRIMARY KEY ("bank_code", "name")'
+            else:
+                # id가 PK인 경우에도 bank_code + name은 유니크해야 함
+                extra_constraints = f', UNIQUE ("bank_code", "name")'
 
         create_sql = f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
@@ -107,9 +114,14 @@ class PostgreExporter:
         # UPSERT 로직 추가 (ON CONFLICT)
         conflict_target = '"url"'
         if table_name.endswith("members"):
-            conflict_target = '"bank_code", "name"'
+            if "id" in df.columns:
+                conflict_target = '"id"'
+            else:
+                conflict_target = '"bank_code", "name"'
         
-        update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c.lower() not in ['url', 'bank_code', 'name']]
+        # 업데이트에서 제외할 키 컬럼들
+        key_cols = ['url', 'bank_code', 'name', 'id', 'speech_id']
+        update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c.lower() not in key_cols]
 
         return self._insert_chunk(df, table_name, col_names, conflict_target, update_cols)
 
@@ -124,6 +136,9 @@ class PostgreExporter:
             for val in row:
                 if pd.isna(val):
                     row_values.append("NULL")
+                elif isinstance(val, (int, float, complex)) and not isinstance(val, bool):
+                    # 숫자는 따옴표 없이 (단, Int64 등 pandas 타입 대응을 위해 str 변환 후 검사)
+                    row_values.append(f"{val}")
                 elif isinstance(val, str):
                     safe_str = val.replace("'", "''")
                     row_values.append(f"'{safe_str}'")
@@ -158,8 +173,16 @@ class PostgreExporter:
         data = self.db.get_unsynced_members()
         if not data: return 0
         df = pd.DataFrame(data)
-        # 필요 없는 컬럼 제거 및 정리
-        cols = ['bank_code', 'name', 'role', 'status', 'term_start', 'term_end', 'last_speech_date', 'avg_stance_score', 'last_updated']
+        
+        # ID 컬럼 정수형 강제 (NaN이 있어도 float 방지)
+        if 'id' in df.columns:
+            df['id'] = pd.to_numeric(df['id'], errors='coerce').astype('Int64')
+
+        # 모든 유효 필드 포함 (Tableau 연결을 위해 id 포함)
+        cols = [
+            'id', 'bank_code', 'name', 'role', 'status', 'term_start', 'term_end', 
+            'last_speech_date', 'last_verified_at', 'avg_stance_score', 'last_updated'
+        ]
         df = df[cols]
         count = self.bulk_insert_df(df, f"{self.prefix}members")
         if count:
@@ -170,7 +193,19 @@ class PostgreExporter:
         data = self.db.get_unsynced_speeches(limit=batch_size)
         if not data: return 0
         df = pd.DataFrame(data)
-        cols = ['bank_code', 'speaker', 'title', 'date', 'url', 'full_text', 'speech_type', 'language', 'fetched_at']
+
+        # ID 컬럼 정수형 강제
+        for col in ['id', 'speaker_id']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+
+        # m.name as speaker와 s.speaker_id(로컬ID)를 모두 포함하여 연결성 강화
+        # 모든 유효 필드 포함 (id 포함)
+        cols = [
+            'id', 'bank_code', 'speaker', 'speaker_id', 'title', 'date', 'url', 
+            'full_text', 'speech_type', 'language', 'fetched_at', 'created_at',
+            'stance_score', 'stance_reason', 'keywords', 'main_risk'
+        ]
         df = df[cols]
         count = self.bulk_insert_df(df, f"{self.prefix}speeches")
         if count:
@@ -181,8 +216,16 @@ class PostgreExporter:
         data = self.db.get_unsynced_analysis(limit=batch_size)
         if not data: return 0
         df = pd.DataFrame(data)
+
+        # speech_id 포함 및 정수형 강제
+        if 'speech_id' in df.columns:
+            df['speech_id'] = pd.to_numeric(df['speech_id'], errors='coerce').astype('Int64')
+
         # analysis_results 테이블은 url을 기준으로 매칭
-        cols = ['url', 'stance_score', 'stance_reason', 'keywords', 'main_risk', 'analysis_status', 'analyzed_at']
+        cols = [
+            'url', 'speech_id', 'stance_score', 'stance_reason', 'keywords', 'main_risk', 
+            'analysis_attempts', 'analysis_status', 'analyzed_at'
+        ]
         df = df[cols]
         count = self.bulk_insert_df(df, f"{self.prefix}analysis_results")
         if count:

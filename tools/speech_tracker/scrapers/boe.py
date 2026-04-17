@@ -21,27 +21,37 @@ class BOEScraper(BaseScraper):
     def fetch_speech_list(self, year=None):
         """Fetch list of BOE speeches. Prefers /news/speeches for recent years."""
         current_year = datetime.now().year
-        # If we are looking for the current year or recent speeches, 
-        # use the news/speeches page which is much smaller than the sitemap.
         if year is None or year >= current_year - 1:
             url = f"{self.BASE_URL}/news/speeches"
+            html = self._get_playwright(url)
         else:
             url = f"{self.BASE_URL}/sitemap/speeches"
+            resp = self._get(url)
+            html = resp.text if resp else None
             
-        resp = self._get(url)
-        if not resp:
+        if not html:
             # Fallback
             url = f"{self.BASE_URL}/sitemap/speeches" if "news" in url else f"{self.BASE_URL}/news/speeches"
-            resp = self._get(url)
-            if not resp:
+            if "news" in url:
+                html = self._get_playwright(url)
+            else:
+                resp = self._get(url)
+                html = resp.text if resp else None
+            if not html:
                 return []
 
-        soup = self._parse_html(resp.text)
+        soup = self._parse_html(html)
         speeches = []
 
         for link in soup.find_all('a', href=True):
             href = link['href']
-            title = link.get_text(strip=True)
+            
+            # Check if this is the new structured format
+            h3_list = link.find('h3', class_='list')
+            if h3_list:
+                title = h3_list.get_text(strip=True)
+            else:
+                title = link.get_text(strip=True)
 
             if not title or len(title) < 10:
                 continue
@@ -58,13 +68,27 @@ class BOEScraper(BaseScraper):
             else:
                 speech_url = f"{self.BASE_URL}/{href}"
 
-            # Initial date from URL (defaults to 1st of the month)
-            date = self._extract_date_from_url(href, year)
+            # Modern format date extraction
+            time_tag = link.find('time', class_='release-date')
+            if time_tag and time_tag.get('datetime'):
+                date = time_tag['datetime'][:10]
+            else:
+                # Initial date from URL (defaults to 1st of the month)
+                date = self._extract_date_from_url(href, year)
 
             if year and date and not date.startswith(str(year)):
                 continue
 
-            speaker = self.extract_speaker_from_title(title)
+            # Check if speaker is in the tag
+            speaker = None
+            tag = link.find('div', class_='release-tag')
+            if tag:
+                tag_text = tag.get_text(strip=True)
+                if '//' in tag_text:
+                    speaker = tag_text.split('//')[-1].strip()
+
+            if not speaker:
+                speaker = self.extract_speaker_from_title(title)
 
             speeches.append({
                 'title': title,
