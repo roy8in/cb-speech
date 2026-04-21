@@ -1,59 +1,100 @@
 # Central Bank Speech Tracker
 
-Automated, locally-run data pipeline that collects, analyzes, and synchronizes official speeches from the world's major central banks (FRB, ECB, BOE, BOJ, RBA, BOC).
+Python pipeline for collecting official speeches from major central banks, storing them locally in SQLite, analyzing them with Gemini, and syncing the structured data to a PostgreSQL API for downstream reporting.
 
-This project tracks central bank communications, performs local natural language processing (NLP) to gauge hawkish/dovish monetary policy stance, and pushes the consolidated structured data to a PostgreSQL database for use in a Tableau dashboard.
+## What It Does
 
-## Key Features
+- Collects speech metadata and full text from 6 central banks: `FRB`, `ECB`, `BOE`, `BOJ`, `RBA`, and `BOC`
+- Stores raw and normalized data in a local SQLite database at `data/speech_tracker/speeches.db`
+- Uses Google GenAI (`google-genai`) to score speeches on a hawkish/dovish scale and extract key economic themes
+- Tracks sync state with `synced_at` fields so only unsynced records are pushed to PostgreSQL
+- Handles dynamic pages with Playwright and can extract text from PDFs when `pdfplumber` is available
+- Includes a full-text search index on speech titles and transcripts via SQLite FTS5
 
-- **Automated Collection:** Built-in web scrapers to gather the latest speech metadata, transcripts (including PDFs), and speaker details from 6 major central banks.
-- **Local NLP Pipeline:** Uses **Ollama (Llama 3.1)** locally for offline, hardware-accelerated analysis of central bank rhetoric—completely eliminating dependency on paid APIs like OpenAI and ensuring privacy for sensitive data.
-- **Hawkish/Dovish Scoring:** Text sentiment is algorithmically scored on a standardized scale to gauge the monetary policy trajectory.
-- **Robust Synchronization:** Smart batched synchronization logic that reliably pushing mass amounts of data (speeches, analysis results, and member metadata) from a local `SQLite` database into a remote `PostgreSQL` production database.
-- **Background Automation:** Hands-free execution scheduled every 4 hours utilizing macOS `crontab`.
+## Main Components
 
-## Project Architecture
+- `tools/speech_tracker/scrapers/`: Bank-specific scrapers built on a shared base class
+- `tools/speech_tracker/models.py`: SQLite schema, migrations, and local data access helpers
+- `tools/speech_tracker/analyzer.py`: Gemini-backed stance analysis
+- `tools/speech_tracker/exporter.py`: PostgreSQL API sync logic with chunked inserts
+- `scripts/speech_tracker/sync_and_analyze.py`: Main end-to-end runner
+- `scripts/speech_tracker/reupload_all.py`: Full re-upload workflow for resetting and resyncing data
 
-1. **`collector.py` / `/scrapers`**: Checks websites for new speeches, downloads content, and applies duplicate management (UPSERT).
-2. **`models.py` (Local DB):** Handles local `SQLite` schema logic. Unsynced changes are carefully tracked via a dedicated `synced_at` column to ensure no dropped data.
-3. **`sync_and_analyze.py`**: The main orchestration script. Combines downloading, Ollama analysis of pending entries, and PostgreSQL export into a single cohesive pipeline.
-4. **`exporter.py`**: Interacts with the production PostgreSQL API. Handles recursive chunking to ensure that extremely large speech transcripts do not cause API timeout errors during bulk INSERTs.
+## Analysis Model
 
-## Setup & Running
+The analyzer currently uses `gemini-2.5-flash` through `google-genai`.
 
-This project has been migrated from a GitHub Actions-based automated system to a highly reliable localized execution environment.
+It produces:
+
+- `stance_score`
+- `stance_reason`
+- `keywords`
+- `main_risk`
+
+Speech records are marked as:
+
+- `scored`
+- `no_signal`
+- `skipped`
+- `pending`
+
+## Setup
 
 ### Prerequisites
 
-- macOS runtime environment
-- Python 3+ (managed via `.venv`)
-- **Ollama** installed and running locally with the `llama3.1` model. 
-- `.env` file configured with database API keys:
-  ```env
-  POSTGRE_API_URL=https://your-database-api-url
-  POSTGRE_API_KEY=your_secure_api_key
-  ```
+- Python 3.10+
+- A Google API key set as either `GOOGLE_API_KEY_FREE_TIER` or `GOOGLE_API_KEY`
+- PostgreSQL API credentials set as:
+  - `POSTGRE_API_URL`
+  - `POSTGRE_API_KEY`
 
-### Manual Execution
+### Install
 
-Trigger a complete end-to-end run manually:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install
+```
+
+If you expect to scrape PDFs, also install:
+
+```bash
+pip install pdfplumber
+```
+
+## Running
+
+Run the full pipeline:
 
 ```bash
 source .venv/bin/activate
 python scripts/speech_tracker/sync_and_analyze.py
 ```
 
-### Automation
-
-The system is configured to run entirely in the background via local `cron`. The current crontab runs the master script every 4 hours:
+Useful collector options:
 
 ```bash
-0 */4 * * * cd /Users/kimberlywexler/work/cb-speeches && /Users/kimberlywexler/work/cb-speeches/.venv/bin/python3 /Users/kimberlywexler/work/cb-speeches/scripts/speech_tracker/sync_and_analyze.py >> /Users/kimberlywexler/work/cb-speeches/sync.log 2>&1
+python tools/speech_tracker/collector.py --stats
+python tools/speech_tracker/collector.py --mode recent
+python tools/speech_tracker/collector.py --mode full --start-year 2015
+python tools/speech_tracker/collector.py --sync-only
+python tools/speech_tracker/collector.py --test
+python scripts/speech_tracker/report_pipeline.py --limit 5
 ```
 
-All standard output and background errors are redirected to `sync.log`.
+## Data Flow
 
-## Recent Updates
-*   **Decoupled Sync Logic**: Added explicit synchronization tracking (`synced_at`) to the analysis results table to guarantee completion regardless of prior status.
-*   **Recursive Export Chunking**: Handled PostgreSQL API errors implicitly caused by payload size limits by dynamically halving the batch sizes of failed database chunks until success.
-*   **Error Handling**: Upgraded data sanitization logic (correctly handling missing dates, fixing Unicode characters like `£`, resolving path collisions between web texts vs PDF archives).
+1. Scrapers fetch speech lists and, when requested, full speech text.
+2. New records are inserted into SQLite.
+3. The analyzer processes pending speeches and writes results back locally.
+4. The exporter pushes unsynced members, speeches, and analysis results to PostgreSQL.
+
+## Notes
+
+- The repository does not include a committed scheduler configuration. If you want periodic runs, add your own `cron` or Task Scheduler entry.
+- The PostgreSQL integration is driven by a custom HTTP API rather than a direct database connection.
+- The `POSTGRE_*` environment variable names are intentionally spelled to match the code.
+- TLS verification is currently disabled in scraper and exporter requests because the project is used in an environment that may rely on proxy or custom certificate handling. Re-enable it if your deployment has a clean certificate chain.
+- Temporary network probes and scrape-debug scripts live under `scripts/speech_tracker/debug/`.
+- Stage-level pipeline timings are stored in `pipeline_logs`, which is the single run-log source used by `scripts/speech_tracker/report_pipeline.py`.

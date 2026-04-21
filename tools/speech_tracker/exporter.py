@@ -39,7 +39,7 @@ class PostgreExporter:
         # API가 'sql' 필드를 기대함 (기존 'query' 아님)
         payload = {"sql": sql_text}
         try:
-            # verify=False는 db_utils.py 설정을 따름
+            # TLS verification is intentionally disabled for the current proxy/certificate environment.
             response = requests.post(self.api_url, json=payload, headers=self.header, verify=False, timeout=60)
             if response.status_code != 200:
                 logger.error(f"API Error ({response.status_code}): {response.text[:500]}")

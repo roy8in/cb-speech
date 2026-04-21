@@ -151,25 +151,6 @@ class BOEScraper(BaseScraper):
             return f"{default_year}-01-01"
         return ''
 
-    def _get_playwright(self, url):
-        """Use Playwright to get page content, bypassing bot protection."""
-        from playwright.sync_api import sync_playwright
-        import time
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=self.HEADERS['User-Agent'])
-            page = context.new_page()
-            try:
-                page.goto(url, wait_until='networkidle')
-                time.sleep(2)  # Give JS time to load if necessary
-                content = page.content()
-                return content
-            except Exception as e:
-                logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
-                return None
-            finally:
-                browser.close()
-
     def fetch_speech_text(self, url):
         """Fetch the full text and exact date of a BOE speech."""
         content_type = ""

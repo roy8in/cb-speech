@@ -42,6 +42,10 @@ class ECBScraper(BaseScraper):
         
         return speeches
 
+    def fetch_recent_speeches(self):
+        """Fetch only the latest ECB speeches from the RSS feed."""
+        return self.fetch_recent_from_html()
+
     def _fetch_from_csv(self, year=None):
         resp = self._get(self.CSV_URL)
         if not resp:
@@ -216,6 +220,40 @@ class ECBScraper(BaseScraper):
                 new_count += 1
 
         logger.info(f"[ECB] Collection complete: {new_count} new speeches added")
+        return new_count
+
+    def collect_recent(self, fetch_text=True):
+        """
+        Optimized recent collection path.
+
+        Uses RSS only instead of downloading the full CSV dataset on every run.
+        """
+        existing_urls = self.db.get_existing_urls(self.BANK_CODE)
+        speech_list = self.fetch_recent_speeches()
+
+        new_count = 0
+        for speech_info in speech_list:
+            url = speech_info['url']
+            if url in existing_urls:
+                continue
+
+            full_text = None
+            if fetch_text:
+                full_text = self.fetch_speech_text(url)
+
+            speech_id = self.db.insert_speech(
+                bank_code=self.BANK_CODE,
+                speaker=speech_info.get('speaker'),
+                title=speech_info['title'],
+                date=speech_info['date'],
+                url=url,
+                full_text=full_text,
+            )
+
+            if speech_id:
+                new_count += 1
+
+        logger.info(f"[ECB] Recent collection complete: {new_count} new speeches added")
         return new_count
 
     def get_all_speeches(self, start_year=None, end_year=None):

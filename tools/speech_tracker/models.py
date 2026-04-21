@@ -8,7 +8,6 @@ Tables:
 """
 
 import sqlite3
-import os
 import json
 import sys
 from datetime import datetime
@@ -93,16 +92,21 @@ class SpeechDB:
                 CREATE INDEX IF NOT EXISTS idx_analysis_status ON analysis_results(analysis_status);
                 CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
 
-                -- 3. 수집 로그 테이블
-                CREATE TABLE IF NOT EXISTS collection_logs (
+                CREATE TABLE IF NOT EXISTS pipeline_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    stage_name TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
-                    status TEXT, -- 'success', 'partial', 'failed'
-                    bank_stats_json TEXT, -- 각 은행별 수집 건수 (JSON)
+                    duration_seconds REAL,
+                    status TEXT,
+                    item_count INTEGER DEFAULT 0,
                     error_message TEXT,
-                    total_new_speeches INTEGER DEFAULT 0
+                    details_json TEXT
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_pipeline_logs_run_id ON pipeline_logs(run_id);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_logs_stage_name ON pipeline_logs(stage_name);
             """)
             
             # Migration for existing DBs
@@ -197,15 +201,63 @@ class SpeechDB:
             except sqlite3.OperationalError:
                 pass
 
-    def log_collection_result(self, started_at, finished_at, status, bank_stats, total_new, error_msg=None):
-        """Record the result of a collection run in the database."""
+        # 4. Pipeline logs for stage-by-stage run tracking
+        cursor = conn.execute("PRAGMA table_info(pipeline_logs)")
+        pipeline_cols = [row['name'] for row in cursor.fetchall()]
+        if not pipeline_cols:
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS pipeline_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id TEXT NOT NULL,
+                        stage_name TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        duration_seconds REAL,
+                        status TEXT,
+                        item_count INTEGER DEFAULT 0,
+                        error_message TEXT,
+                        details_json TEXT
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_logs_run_id ON pipeline_logs(run_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_logs_stage_name ON pipeline_logs(stage_name)")
+            except sqlite3.OperationalError:
+                pass
+        elif 'duration_seconds' not in pipeline_cols:
+            try:
+                conn.execute("ALTER TABLE pipeline_logs ADD COLUMN duration_seconds REAL")
+            except sqlite3.OperationalError:
+                pass
+
+    def log_pipeline_step(self, run_id, stage_name, started_at, finished_at, status, item_count=0, error_msg=None, details=None):
+        """Record a single pipeline stage in the dedicated step log table."""
         conn = self._get_conn()
         try:
+            duration_seconds = None
+            try:
+                if started_at and finished_at:
+                    duration_seconds = (
+                        datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
+                    ).total_seconds()
+            except Exception:
+                duration_seconds = None
+
             conn.execute("""
-                INSERT INTO collection_logs 
-                (started_at, finished_at, status, bank_stats_json, total_new_speeches, error_message)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (started_at, finished_at, status, json.dumps(bank_stats), total_new, error_msg))
+                INSERT INTO pipeline_logs
+                (run_id, stage_name, started_at, finished_at, duration_seconds, status, item_count, error_message, details_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                run_id,
+                stage_name,
+                started_at,
+                finished_at,
+                duration_seconds,
+                status,
+                item_count,
+                error_msg,
+                json.dumps(details) if details is not None else None,
+            ))
             conn.commit()
         finally:
             conn.close()

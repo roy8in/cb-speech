@@ -8,6 +8,7 @@ import logging
 import time
 import urllib3
 import io
+import atexit
 from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -48,11 +49,16 @@ class BaseScraper(ABC):
         self.db = db or SpeechDB()
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
+        self._playwright_manager = None
+        self._playwright_browser = None
+        self._playwright_context = None
+        atexit.register(self.close)
 
     def _get(self, url, **kwargs):
         """Make a GET request with delay and error handling."""
         time.sleep(self.REQUEST_DELAY)
         try:
+            # TLS verification is intentionally disabled for the current proxy/certificate environment.
             resp = self.session.get(url, timeout=self.REQUEST_TIMEOUT, verify=False, **kwargs)
             resp.raise_for_status()
             
@@ -106,21 +112,52 @@ class BaseScraper(ABC):
         """Use Playwright to get page content, bypassing bot protection and dynamic loading."""
         from playwright.sync_api import sync_playwright
         import time
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=self.HEADERS['User-Agent'])
-            page = context.new_page()
+        try:
+            if self._playwright_manager is None:
+                self._playwright_manager = sync_playwright().start()
+                self._playwright_browser = self._playwright_manager.chromium.launch(headless=True)
+                self._playwright_context = self._playwright_browser.new_context(
+                    user_agent=self.HEADERS['User-Agent']
+                )
+
+            page = self._playwright_context.new_page()
             try:
                 page.goto(url, wait_until='networkidle', timeout=self.REQUEST_TIMEOUT * 1000)
                 if wait_ms > 0:
                     time.sleep(wait_ms / 1000)
                 content = page.content()
                 return content
-            except Exception as e:
-                logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
-                return None
             finally:
-                browser.close()
+                page.close()
+        except Exception as e:
+            logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
+            self._close_playwright()
+            return None
+
+    def _close_playwright(self):
+        if self._playwright_context is not None:
+            try:
+                self._playwright_context.close()
+            except Exception:
+                pass
+            self._playwright_context = None
+
+        if self._playwright_browser is not None:
+            try:
+                self._playwright_browser.close()
+            except Exception:
+                pass
+            self._playwright_browser = None
+
+        if self._playwright_manager is not None:
+            try:
+                self._playwright_manager.stop()
+            except Exception:
+                pass
+            self._playwright_manager = None
+
+    def close(self):
+        self._close_playwright()
 
     @abstractmethod
     def fetch_speech_list(self, year=None):

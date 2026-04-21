@@ -1,5 +1,9 @@
+from pathlib import Path
 import sys
 import logging
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
 logging.basicConfig(level=logging.INFO)
 
 from tools.speech_tracker.scrapers.ecb import ECBScraper
@@ -11,7 +15,8 @@ try:
     print("ECB SPEECHES:")
     ecb_speeches = ecb.fetch_speech_list(year=2026)
     print(f"Found {len(ecb_speeches)} ECB speeches for 2026")
-    for s in ecb_speeches[:3]: print(s)
+    for s in ecb_speeches[:3]:
+        print(s)
 except Exception as e:
     print(f"ECB Error: {e}")
 
@@ -20,7 +25,8 @@ try:
     print("\nRBA SPEECHES:")
     rba_speeches = rba.fetch_speech_list(year=2026)
     print(f"Found {len(rba_speeches)} RBA speeches for 2026")
-    for s in rba_speeches[:3]: print(s)
+    for s in rba_speeches[:3]:
+        print(s)
 except Exception as e:
     print(f"RBA Error: {e}")
 
@@ -29,6 +35,7 @@ try:
     print("\nBOE SPEECHES:")
     boe_speeches = boe.fetch_speech_list(year=2026)
     print(f"Found {len(boe_speeches)} BOE speeches for 2026")
-    for s in boe_speeches[:3]: print(s)
+    for s in boe_speeches[:3]:
+        print(s)
 except Exception as e:
     print(f"BOE Error: {e}")

@@ -6,6 +6,7 @@ Source: https://www.boj.or.jp/en/about/press/koen_year/index.htm
 
 import re
 import logging
+from datetime import datetime
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ class BOJScraper(BaseScraper):
 
     def fetch_speech_list(self, year=None):
         """Fetch list of BOJ speeches for a given year."""
-        year_str = str(year) if year else "2026"
+        year_str = str(year) if year else str(datetime.now().year)
         url = f"{self.BASE_URL}/en/about/press/koen_{year_str}/index.htm"
         
         resp = self._get(url)

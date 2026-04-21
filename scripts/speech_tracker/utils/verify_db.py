@@ -1,7 +1,12 @@
 import sqlite3
 import sys
+from pathlib import Path
 
-DB_PATH = 'data/speeches.db'
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from tools.speech_tracker.models import get_db_path
+
+DB_PATH = get_db_path()
 
 def main():
     conn = sqlite3.connect(DB_PATH)
