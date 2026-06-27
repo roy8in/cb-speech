@@ -30,6 +30,30 @@ class BOJScraper(BaseScraper):
         soup = self._parse_html(resp.text)
         speeches = []
 
+        for row in soup.select('table tr'):
+            cells = row.find_all('td')
+            if len(cells) < 3:
+                continue
+
+            link = cells[2].find('a', href=True)
+            if not link:
+                continue
+
+            title = link.get_text(' ', strip=True)
+            href = link['href']
+            if not self._is_speech_href(href) or not title:
+                continue
+
+            speeches.append({
+                'title': title,
+                'date': self._parse_boj_date(cells[0].get_text(' ', strip=True)) or f"{year_str}-01-01",
+                'url': self._absolute_url(href),
+                'speaker': self._parse_speaker(cells[1].get_text(' ', strip=True)),
+            })
+
+        if speeches:
+            return self._dedupe_speeches(speeches)
+
         # Broaden search: look at all list items and table cells
         for container in soup.find_all(['li', 'td']):
             link = container.find('a', href=True)
@@ -42,17 +66,11 @@ class BOJScraper(BaseScraper):
             if not title or len(title) < 5:
                 continue
 
-            # BOJ speech links usually start with /en/about/press/koen_YYYY/
-            # but older ones might be slightly different. Look for 'koen' or 'press' + pdf/htm
-            if '/koen_' not in href and 'koen' not in href:
-                continue
-
-            # Skip index/navigation links
-            if href.endswith('index.htm') or 'r_menu' in href:
+            if not self._is_speech_href(href):
                 continue
 
             # Build absolute URL
-            speech_url = f"{self.BASE_URL}{href}" if href.startswith('/') else href
+            speech_url = self._absolute_url(href)
 
             # Extract date: in modern <li> it's in the li text. In older <td>, it might be in the previous sibling <td> or same td
             date_text = container.get_text(strip=True)
@@ -78,6 +96,32 @@ class BOJScraper(BaseScraper):
                 'speaker': speaker,
             })
 
+        return self._dedupe_speeches(speeches)
+
+    def _absolute_url(self, href):
+        return f"{self.BASE_URL}{href}" if href.startswith('/') else href
+
+    def _is_speech_href(self, href):
+        # BOJ speech links usually start with /en/about/press/koen_YYYY/.
+        if not href:
+            return False
+        if href.endswith('index.htm') or 'r_menu' in href or 'koen_all' in href:
+            return False
+        return '/koen_' in href or 'koen' in href
+
+    def _parse_speaker(self, text):
+        if not text:
+            return None
+
+        name = text.split(',', 1)[0].strip()
+        parts = name.split()
+        if len(parts) >= 2 and parts[0].isupper():
+            surname = parts[0].title()
+            given = ' '.join(part.title() if part.isupper() else part for part in parts[1:])
+            return f"{given} {surname}"
+        return name
+
+    def _dedupe_speeches(self, speeches):
         # Handle Full Text vs Summary
         key_map = {}
         for s in speeches:
@@ -99,6 +143,7 @@ class BOJScraper(BaseScraper):
     def _parse_boj_date(self, text):
         """Parse BOJ date format (e.g., 'Mar. 3, 2026')."""
         from datetime import datetime
+        text = text.replace('\xa0', ' ')
         # Regex to find something like "Mar. 3, 2026"
         match = re.search(r'([A-Za-z]+\.?\s+\d{1,2},\s+\d{4})', text)
         if match:
@@ -117,8 +162,7 @@ class BOJScraper(BaseScraper):
         if not resp:
             return None
 
-        content_type = resp.headers.get('Content-Type', '').lower()
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+        if self._is_pdf_response(url, resp):
             return self.extract_pdf_text(resp.content)
 
         try:

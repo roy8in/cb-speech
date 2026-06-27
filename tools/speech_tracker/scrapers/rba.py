@@ -29,7 +29,7 @@ class RBAScraper(BaseScraper):
             
         html = self._get_playwright(url, wait_ms=3000)
         if not html:
-            return []
+            raise RuntimeError(f"Failed to load RBA speeches page: {url}")
 
         soup = self._parse_html(html)
         speeches = []
@@ -121,11 +121,21 @@ class RBAScraper(BaseScraper):
     def fetch_speech_text(self, url):
         """Fetch the full text of an RBA speech."""
         # Handle PDFs before passing to Playwright
-        if url.lower().endswith('.pdf'):
+        if self._is_pdf_response(url):
             resp = self._get(url)
-            if resp:
+            if resp and self._is_pdf_response(url, resp):
                 return self.extract_pdf_text(resp.content)
             return None
+
+        try:
+            head_resp = self.session.head(url, timeout=self.REQUEST_TIMEOUT, verify=False)
+            if self._is_pdf_response(url, content_type=head_resp.headers.get('Content-Type', '')):
+                resp = self._get(url)
+                if resp:
+                    return self.extract_pdf_text(resp.content)
+                return None
+        except Exception:
+            pass
             
         html = self._get_playwright(url)
         if not html: return None

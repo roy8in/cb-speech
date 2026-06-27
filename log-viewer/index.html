@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Central Bank Speeches Pipeline Log Viewer</title>
+  <link rel="stylesheet" href="./style.css?v=20260626_success_tones">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Central Bank Speeches Pipeline</h1>
+        <p>중앙은행 연설 수집, 분석, 동기화 로그를 pipeline 형태로 확인합니다.</p>
+      </div>
+      <div class="top-actions">
+        <label class="date-control">
+          <span>Log date</span>
+          <input id="logDate" type="date">
+        </label>
+        <button id="openIssues" class="ghost-button" type="button">Warnings & Errors</button>
+      </div>
+    </header>
+
+    <section id="notice" class="notice hidden"></section>
+
+    <section class="summary-grid" aria-label="Run summary">
+      <article class="metric">
+        <span>Status</span>
+        <strong id="statusText">-</strong>
+      </article>
+      <article class="metric">
+        <span>Run ID</span>
+        <strong id="runIdText">-</strong>
+      </article>
+      <article class="metric">
+        <span>Started</span>
+        <strong id="startedText">-</strong>
+      </article>
+      <article class="metric">
+        <span>Ended</span>
+        <strong id="endedText">-</strong>
+      </article>
+      <article class="metric">
+        <span>Duration</span>
+        <strong id="durationText">-</strong>
+      </article>
+      <article class="metric">
+        <span>Counts</span>
+        <strong id="rowsText">-</strong>
+      </article>
+    </section>
+
+    <section class="duration-panel">
+      <div class="panel-title">
+        <h2>Duration by Job</h2>
+        <span>share of timed pipeline work</span>
+      </div>
+      <div id="durationBars" class="duration-bars"></div>
+    </section>
+
+    <section class="pipeline-panel">
+      <div class="panel-title">
+        <h2>Pipeline Jobs</h2>
+        <span id="eventCount">0 events</span>
+      </div>
+      <div id="pipeline" class="pipeline"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <h2>Raw Events</h2>
+        <div class="filters">
+          <select id="levelFilter" aria-label="Level filter">
+            <option value="all">All levels</option>
+            <option value="INFO">Info</option>
+            <option value="WARNING">Warning</option>
+            <option value="ERROR">Error</option>
+            <option value="EXCEPTION">Exception</option>
+          </select>
+          <input id="searchBox" type="search" placeholder="Search logs">
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Level</th>
+              <th>Logger</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="eventRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <aside id="issueDrawer" class="drawer" aria-hidden="true">
+    <div class="drawer-card">
+      <div class="panel-title">
+        <h2>Warnings & Errors</h2>
+        <button id="closeIssues" class="ghost-button" type="button">Close</button>
+      </div>
+      <p id="issueCount" class="drawer-subtitle">0 issues</p>
+      <div id="issues" class="issue-list"></div>
+    </div>
+  </aside>
+
+  <script src="./app.js?v=20260626_success_tones"></script>
+</body>
+</html>

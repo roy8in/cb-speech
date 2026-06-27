@@ -161,10 +161,14 @@ class BOEScraper(BaseScraper):
         except:
             pass
 
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+        if self._is_pdf_response(url, content_type=content_type):
             resp = self._get(url)
             if resp:
-                return self.extract_pdf_text(resp.content)
+                text = self.extract_pdf_text(resp.content)
+                exact_date = self._extract_date_from_text(text)
+                if exact_date:
+                    return f"__DATE__:{exact_date}\n{text}"
+                return text
             return None
             
         html = self._get_playwright(url)
@@ -248,6 +252,28 @@ class BOEScraper(BaseScraper):
         if exact_date:
             return f"__DATE__:{exact_date}\n{text}"
         return text
+
+    def _extract_date_from_text(self, text):
+        """Extract a BOE-style speech date from the first page of text."""
+        if not text:
+            return None
+
+        raw_start = text[:2500]
+        patterns = [
+            r'\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b',
+            r'\b([A-Z][a-z]+\s+\d{1,2},\s+\d{4})\b',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, raw_start)
+            if not match:
+                continue
+            date_text = match.group(1)
+            for fmt in ('%d %B %Y', '%B %d, %Y'):
+                try:
+                    return datetime.strptime(date_text, fmt).strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+        return None
 
     def get_all_speeches(self, start_year=None, end_year=None):
         all_speeches = self.fetch_speech_list()

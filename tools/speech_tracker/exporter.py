@@ -29,6 +29,8 @@ class PostgreExporter:
             "Content-Type": "application/json"
         }
         self.prefix = "cb_speech_"
+        self.last_sync_stats = {}
+        self.last_mart_counts = {}
 
     def send_sql(self, sql_text):
         """db_utils.py 호환 SQL 전송 함수"""
@@ -169,6 +171,294 @@ class PostgreExporter:
         count_b = self._insert_chunk(df.iloc[mid:], table_name, col_names, conflict_target, update_cols)
         return count_a + count_b
 
+    def bulk_upsert_df(self, df, table_name, conflict_target, update_key_cols=None, chunk_size=500):
+        """Bulk UPSERT with an explicit conflict target for Tableau mart tables."""
+        if df.empty:
+            return 0
+
+        col_names = ', '.join([f'"{c}"' for c in df.columns])
+        key_cols = {c.lower() for c in (update_key_cols or [])}
+        update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c.lower() not in key_cols]
+        total = 0
+        for start in range(0, len(df), chunk_size):
+            chunk = df.iloc[start:start + chunk_size]
+            total += self._insert_chunk(chunk, table_name, col_names, conflict_target, update_cols)
+        return total
+
+    def create_sentiment_mart_tables(self):
+        """Create Tableau-facing sentiment mart tables with stable primary keys."""
+        sql = f"""
+        CREATE TABLE IF NOT EXISTS {self.prefix}sentiment_events (
+            "speech_id" BIGINT PRIMARY KEY,
+            "url" TEXT,
+            "date" DATE,
+            "bank_code" TEXT,
+            "speaker" TEXT,
+            "title" TEXT,
+            "stance_score" REAL,
+            "stance_reason" TEXT,
+            "keywords" TEXT,
+            "main_risk" TEXT,
+            "analysis_status" TEXT,
+            "analyzed_at" TIMESTAMP,
+            "fetched_at" TIMESTAMP,
+            "created_at" TIMESTAMP,
+            "collection_lag_days" BIGINT,
+            "analysis_lag_days" BIGINT,
+            "updated_at" TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS {self.prefix}sentiment_daily (
+            "date" DATE NOT NULL,
+            "bank_code" TEXT NOT NULL,
+            "daily_stance_score" REAL,
+            "daily_scored_speech_count" BIGINT,
+            "daily_total_speech_count" BIGINT,
+            "stance_level_locf" REAL,
+            "freshness_weight_hl14d" REAL,
+            "freshness_adjusted_stance" REAL,
+            "last_scored_speech_date" DATE,
+            "days_since_last_scored_speech" BIGINT,
+            "is_score_fresh" BIGINT,
+            "has_scored_speech" BIGINT,
+            "updated_at" TIMESTAMP,
+            PRIMARY KEY ("date", "bank_code")
+        );
+
+        CREATE TABLE IF NOT EXISTS {self.prefix}sentiment_plot (
+            "row_id" TEXT PRIMARY KEY,
+            "date" DATE NOT NULL,
+            "bank_code" TEXT NOT NULL,
+            "mark_type" TEXT NOT NULL,
+            "speech_id" BIGINT,
+            "speaker" TEXT,
+            "title" TEXT,
+            "stance_reason" TEXT,
+            "line_score" REAL,
+            "bar_score" REAL,
+            "stance_score" REAL,
+            "freshness_weight_hl14d" REAL,
+            "freshness_adjusted_stance" REAL,
+            "days_since_last_scored_speech" BIGINT,
+            "is_score_fresh" BIGINT,
+            "has_scored_speech" BIGINT,
+            "updated_at" TIMESTAMP
+        );
+        """
+        return self.send_sql(sql)
+
+    def get_sentiment_events_df(self):
+        """Speech-level sentiment rows for Tableau bars and tooltips."""
+        conn = self.db._get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT
+                    s.id AS speech_id,
+                    s.url,
+                    substr(s.date, 1, 10) AS date,
+                    s.bank_code,
+                    m.name AS speaker,
+                    s.title,
+                    ar.stance_score,
+                    ar.stance_reason,
+                    ar.keywords,
+                    ar.main_risk,
+                    ar.analysis_status,
+                    ar.analyzed_at,
+                    s.fetched_at,
+                    s.created_at
+                FROM speeches s
+                LEFT JOIN members m ON s.speaker_id = m.id
+                JOIN analysis_results ar ON s.id = ar.speech_id
+                WHERE ar.analysis_status IN ('scored', 'no_signal')
+                ORDER BY s.bank_code, date, s.id
+            """).fetchall()
+            df = pd.DataFrame([dict(r) for r in rows])
+        finally:
+            conn.close()
+
+        if df.empty:
+            return df
+
+        now = datetime.now().isoformat()
+        df['speech_id'] = pd.to_numeric(df['speech_id'], errors='coerce').astype('Int64')
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date.astype('string')
+        for col in ['analyzed_at', 'fetched_at', 'created_at']:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+        speech_date = pd.to_datetime(df['date'], errors='coerce')
+        df['collection_lag_days'] = (df['fetched_at'].dt.normalize() - speech_date).dt.days.astype('Int64')
+        df['analysis_lag_days'] = (df['analyzed_at'].dt.normalize() - speech_date).dt.days.astype('Int64')
+        df['updated_at'] = now
+
+        return df[[
+            'speech_id', 'url', 'date', 'bank_code', 'speaker', 'title',
+            'stance_score', 'stance_reason', 'keywords', 'main_risk',
+            'analysis_status', 'analyzed_at', 'fetched_at', 'created_at',
+            'collection_lag_days', 'analysis_lag_days', 'updated_at'
+        ]]
+
+    def get_sentiment_daily_df(self, half_life_days=14, fresh_days=45):
+        """Bank-date calendar spine with daily sentiment state for Tableau lines."""
+        events = self.get_sentiment_events_df()
+        if events.empty:
+            return events
+
+        scored = events[
+            (events['analysis_status'] == 'scored') &
+            (events['stance_score'].notna())
+        ].copy()
+        scored['date'] = pd.to_datetime(scored['date'], errors='coerce')
+
+        speech_counts = (
+            events.assign(date=pd.to_datetime(events['date'], errors='coerce'))
+            .groupby(['bank_code', 'date'], as_index=False)
+            .agg(daily_total_speech_count=('speech_id', 'count'))
+        )
+
+        daily_scores = (
+            scored.groupby(['bank_code', 'date'], as_index=False)
+            .agg(
+                daily_stance_score=('stance_score', 'mean'),
+                daily_scored_speech_count=('speech_id', 'count'),
+            )
+        )
+
+        banks = sorted(events['bank_code'].dropna().unique())
+        end_date = pd.Timestamp.today().normalize()
+        frames = []
+        for bank in banks:
+            bank_dates = pd.to_datetime(events.loc[events['bank_code'] == bank, 'date'], errors='coerce')
+            start_date = bank_dates.min()
+            if pd.isna(start_date):
+                continue
+            frame = pd.DataFrame({
+                'date': pd.date_range(start_date.normalize(), end_date, freq='D'),
+                'bank_code': bank,
+            })
+            frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame()
+
+        daily = pd.concat(frames, ignore_index=True)
+        daily = daily.merge(daily_scores, how='left', on=['bank_code', 'date'])
+        daily = daily.merge(speech_counts, how='left', on=['bank_code', 'date'])
+        daily['daily_scored_speech_count'] = daily['daily_scored_speech_count'].fillna(0).astype('Int64')
+        daily['daily_total_speech_count'] = daily['daily_total_speech_count'].fillna(0).astype('Int64')
+        daily['has_scored_speech'] = (daily['daily_scored_speech_count'] > 0).astype('Int64')
+
+        daily = daily.sort_values(['bank_code', 'date'])
+        daily['stance_level_locf'] = daily.groupby('bank_code')['daily_stance_score'].ffill()
+        daily['last_scored_speech_date'] = daily['date'].where(daily['has_scored_speech'].eq(1))
+        daily['last_scored_speech_date'] = daily.groupby('bank_code')['last_scored_speech_date'].ffill()
+        daily['days_since_last_scored_speech'] = (
+            daily['date'] - daily['last_scored_speech_date']
+        ).dt.days.astype('Int64')
+
+        daily['freshness_weight_hl14d'] = 0.5 ** (
+            daily['days_since_last_scored_speech'].astype(float) / float(half_life_days)
+        )
+        daily.loc[daily['days_since_last_scored_speech'].isna(), 'freshness_weight_hl14d'] = pd.NA
+        daily['freshness_adjusted_stance'] = daily['stance_level_locf'] * daily['freshness_weight_hl14d']
+        daily['is_score_fresh'] = (
+            daily['days_since_last_scored_speech'].notna() &
+            (daily['days_since_last_scored_speech'] <= fresh_days)
+        ).astype('Int64')
+
+        now = datetime.now().isoformat()
+        daily['date'] = daily['date'].dt.date.astype('string')
+        daily['last_scored_speech_date'] = daily['last_scored_speech_date'].dt.date.astype('string')
+        daily['updated_at'] = now
+
+        return daily[[
+            'date', 'bank_code', 'daily_stance_score', 'daily_scored_speech_count',
+            'daily_total_speech_count', 'stance_level_locf', 'freshness_weight_hl14d',
+            'freshness_adjusted_stance', 'last_scored_speech_date',
+            'days_since_last_scored_speech', 'is_score_fresh',
+            'has_scored_speech', 'updated_at'
+        ]]
+
+    def get_sentiment_plot_df(self):
+        """Single-date-axis table for Tableau dual mark charts."""
+        daily = self.get_sentiment_daily_df()
+        events = self.get_sentiment_events_df()
+        if daily.empty:
+            return pd.DataFrame()
+
+        line = pd.DataFrame({
+            'row_id': 'line:' + daily['bank_code'].astype(str) + ':' + daily['date'].astype(str),
+            'date': daily['date'],
+            'bank_code': daily['bank_code'],
+            'mark_type': 'line',
+            'speech_id': pd.Series([pd.NA] * len(daily), dtype='Int64'),
+            'speaker': pd.NA,
+            'title': pd.NA,
+            'stance_reason': pd.NA,
+            'line_score': daily['stance_level_locf'],
+            'bar_score': pd.NA,
+            'stance_score': pd.NA,
+            'freshness_weight_hl14d': daily['freshness_weight_hl14d'],
+            'freshness_adjusted_stance': daily['freshness_adjusted_stance'],
+            'days_since_last_scored_speech': daily['days_since_last_scored_speech'],
+            'is_score_fresh': daily['is_score_fresh'],
+            'has_scored_speech': daily['has_scored_speech'],
+            'updated_at': daily['updated_at'],
+        })
+
+        bars_src = events[
+            (events['analysis_status'] == 'scored') &
+            (events['stance_score'].notna())
+        ].copy()
+        bars = pd.DataFrame({
+            'row_id': 'bar:' + bars_src['speech_id'].astype(str),
+            'date': bars_src['date'],
+            'bank_code': bars_src['bank_code'],
+            'mark_type': 'speech_bar',
+            'speech_id': bars_src['speech_id'],
+            'speaker': bars_src['speaker'],
+            'title': bars_src['title'],
+            'stance_reason': bars_src['stance_reason'],
+            'line_score': pd.NA,
+            'bar_score': bars_src['stance_score'],
+            'stance_score': bars_src['stance_score'],
+            'freshness_weight_hl14d': pd.NA,
+            'freshness_adjusted_stance': pd.NA,
+            'days_since_last_scored_speech': pd.NA,
+            'is_score_fresh': pd.NA,
+            'has_scored_speech': 1,
+            'updated_at': datetime.now().isoformat(),
+        })
+
+        return pd.concat([line, bars], ignore_index=True)
+
+    def upload_sentiment_marts(self):
+        """Rebuild and upload Tableau-facing sentiment mart tables."""
+        if not self.create_sentiment_mart_tables():
+            self.last_mart_counts = {}
+            return 0
+
+        events = self.get_sentiment_events_df()
+        daily = self.get_sentiment_daily_df()
+        plot = self.get_sentiment_plot_df()
+
+        tables = [
+            (f"{self.prefix}sentiment_events", events, '"speech_id"', ['speech_id']),
+            (f"{self.prefix}sentiment_daily", daily, '"date", "bank_code"', ['date', 'bank_code']),
+            (f"{self.prefix}sentiment_plot", plot, '"row_id"', ['row_id']),
+        ]
+
+        total = 0
+        counts = {}
+        for table_name, df, conflict_target, keys in tables:
+            self.send_sql(f"DELETE FROM {table_name};")
+            count = self.bulk_upsert_df(df, table_name, conflict_target, update_key_cols=keys)
+            logger.info(f"  Tableau mart uploaded: {table_name} ({count} rows)")
+            counts[table_name.replace(f"{self.prefix}sentiment_", "")] = count
+            total += count
+        self.last_mart_counts = counts
+        return total
+
     def upload_members(self):
         data = self.db.get_unsynced_members()
         if not data: return 0
@@ -192,49 +482,85 @@ class PostgreExporter:
     def upload_speeches(self, batch_size=100):
         data = self.db.get_unsynced_speeches(limit=batch_size)
         if not data: return 0
-        df = pd.DataFrame(data)
 
-        # ID 컬럼 정수형 강제
-        for col in ['id', 'speaker_id']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+        def prepare_df(rows):
+            df = pd.DataFrame(rows)
 
-        # m.name as speaker와 s.speaker_id(로컬ID)를 모두 포함하여 연결성 강화
-        # 모든 유효 필드 포함 (id 포함)
-        cols = [
-            'id', 'bank_code', 'speaker', 'speaker_id', 'title', 'date', 'url', 
-            'full_text', 'speech_type', 'language', 'fetched_at', 'created_at',
-            'stance_score', 'stance_reason', 'keywords', 'main_risk'
-        ]
-        df = df[cols]
+            # ID 컬럼 정수형 강제
+            for col in ['id', 'speaker_id']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+
+            # m.name as speaker와 s.speaker_id(로컬ID)를 모두 포함하여 연결성 강화
+            # 모든 유효 필드 포함 (id 포함)
+            cols = [
+                'id', 'bank_code', 'speaker', 'speaker_id', 'title', 'date', 'url',
+                'full_text', 'speech_type', 'language', 'fetched_at', 'created_at',
+                'stance_score', 'stance_reason', 'keywords', 'main_risk'
+            ]
+            return df[cols]
+
+        df = prepare_df(data)
         count = self.bulk_insert_df(df, f"{self.prefix}speeches")
-        if count:
+        if count == len(data):
             self.db.mark_as_synced([s['id'] for s in data])
+            return count
+
+        if count:
+            logger.warning(
+                "Partial speech upload (%s/%s); retrying rows individually before marking synced",
+                count,
+                len(data),
+            )
+            count = 0
+            for row in data:
+                row_count = self.bulk_insert_df(prepare_df([row]), f"{self.prefix}speeches")
+                if row_count == 1:
+                    self.db.mark_as_synced([row['id']])
+                    count += 1
         return count
 
     def upload_analysis_results(self, batch_size=100):
         data = self.db.get_unsynced_analysis(limit=batch_size)
         if not data: return 0
-        df = pd.DataFrame(data)
 
-        # speech_id 포함 및 정수형 강제
-        if 'speech_id' in df.columns:
-            df['speech_id'] = pd.to_numeric(df['speech_id'], errors='coerce').astype('Int64')
+        def prepare_df(rows):
+            df = pd.DataFrame(rows)
 
-        # analysis_results 테이블은 url을 기준으로 매칭
-        cols = [
-            'url', 'speech_id', 'stance_score', 'stance_reason', 'keywords', 'main_risk', 
-            'analysis_attempts', 'analysis_status', 'analyzed_at'
-        ]
-        df = df[cols]
+            # speech_id 포함 및 정수형 강제
+            if 'speech_id' in df.columns:
+                df['speech_id'] = pd.to_numeric(df['speech_id'], errors='coerce').astype('Int64')
+
+            # analysis_results 테이블은 url을 기준으로 매칭
+            cols = [
+                'url', 'speech_id', 'stance_score', 'stance_reason', 'keywords', 'main_risk',
+                'analysis_attempts', 'analysis_status', 'analyzed_at'
+            ]
+            return df[cols]
+
+        df = prepare_df(data)
         count = self.bulk_insert_df(df, f"{self.prefix}analysis_results")
-        if count:
+        if count == len(data):
             self.db.mark_analysis_as_synced([d['speech_id'] for d in data])
+            return count
+
+        if count:
+            logger.warning(
+                "Partial analysis upload (%s/%s); retrying rows individually before marking synced",
+                count,
+                len(data),
+            )
+            count = 0
+            for row in data:
+                row_count = self.bulk_insert_df(prepare_df([row]), f"{self.prefix}analysis_results")
+                if row_count == 1:
+                    self.db.mark_analysis_as_synced([row['speech_id']])
+                    count += 1
         return count
 
     def sync_all(self, batch_size=100):
         """Sync all unsynced data to PostgreSQL in batches."""
-        total_m, total_s, total_a = 0, 0, 0
+        total_m, total_s, total_a, total_marts = 0, 0, 0, 0
 
         # Members (usually small, single batch is fine)
         m = self.upload_members()
@@ -256,8 +582,22 @@ class PostgreExporter:
                 break
             logger.info(f"  Analysis batch uploaded: {a} (total so far: {total_a})")
 
-        logger.info(f"Sync complete — Members: {total_m}, Speeches: {total_s}, Analysis: {total_a}")
-        return total_m + total_s + total_a
+        total_marts = self.upload_sentiment_marts()
+
+        self.last_sync_stats = {
+            "members": total_m,
+            "speeches": total_s,
+            "analysis_results": total_a,
+            "source_total": total_m + total_s + total_a,
+            "tableau_marts": total_marts,
+            "mart_counts": dict(self.last_mart_counts),
+            "total": total_m + total_s + total_a + total_marts,
+        }
+        logger.info(
+            f"Sync complete — Members: {total_m}, Speeches: {total_s}, "
+            f"Analysis: {total_a}, Tableau marts: {total_marts}"
+        )
+        return self.last_sync_stats["total"]
 
     def upload_new_speeches(self, limit=None):
         return self.sync_all(batch_size=100)

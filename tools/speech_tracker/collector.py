@@ -2,13 +2,14 @@
 Central Bank Watchtower — Unified Collector
 
 Orchestrates all 6 scrapers, runs analysis, and sends alerts.
-Designed for scheduled execution (2x daily via Task Scheduler or cron).
+Designed for scheduled execution via cron.
 """
 
 import sys
 import argparse
 import logging
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.speech_tracker.models import SpeechDB
 from tools.speech_tracker.scrapers import ALL_SCRAPERS
 from tools.speech_tracker.exporter import PostgreExporter
+from ops_status import (
+    append_event,
+    iso,
+    next_three_hour_run,
+    update_bank,
+    update_stage,
+    update_status,
+)
+from tools.speech_tracker.pipeline_log import log_pipeline_job
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_year=None, run_id=None):
+def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_year=None, run_id=None, pipeline_logger=None):
     """
     Main collection pipeline.
 
@@ -39,6 +49,29 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
     db = SpeechDB()
     run_id = run_id or uuid.uuid4().hex
     target_banks = banks or list(ALL_SCRAPERS.keys())
+    started_at = datetime.now().isoformat()
+    next_run_at = next_three_hour_run()
+    append_event(
+        {
+            "service": "cb-speeches",
+            "stage": "collection",
+            "status": "started",
+            "run_id": run_id,
+            "message": f"collection started for {','.join(target_banks)}",
+        }
+    )
+    update_status(
+        run_id=run_id,
+        state="running",
+        next_run_at=next_run_at,
+        summary={
+            "total_new": 0,
+            "total_refreshed": 0,
+            "analysis_count": 0,
+            "sync_count": 0,
+            "status": "running",
+        },
+    )
     
     started_at = datetime.now().isoformat()
     total_new = 0
@@ -58,10 +91,18 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
         logger.info(f"{'='*50}")
 
         bank_started_at = datetime.now().isoformat()
+        bank_started_perf = time.perf_counter()
         bank_status = 'success'
         bank_error = None
         bank_new_count = 0
         bank_refreshed_count = 0
+        log_pipeline_job(
+            pipeline_logger,
+            f"collect_{bank_code.lower()}",
+            "running",
+            bank_code=bank_code,
+            mode=mode,
+        )
 
         try:
             scraper_cls = ALL_SCRAPERS[bank_code]
@@ -87,6 +128,17 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             total_new += new_count
             bank_new_count = new_count
             logger.info(f"[{bank_code}] {new_count} new speeches added")
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": f"bank:{bank_code}",
+                    "status": "success",
+                    "run_id": run_id,
+                    "message": f"{bank_code} collection finished",
+                    "new_items": bank_new_count,
+                    "refreshed_items": bank_refreshed_count,
+                }
+            )
 
         except Exception as e:
             logger.error(f"[{bank_code}] Pipeline failed: {e}")
@@ -95,8 +147,28 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             bank_error = str(e)
             error_msg = str(e)
             status = 'partial' if total_new > 0 else 'failed'
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": f"bank:{bank_code}",
+                    "status": "failed",
+                    "run_id": run_id,
+                    "message": str(e),
+                }
+            )
         finally:
             bank_finished_at = datetime.now().isoformat()
+            log_pipeline_job(
+                pipeline_logger,
+                f"collect_{bank_code.lower()}",
+                bank_status,
+                bank_started_perf,
+                bank_code=bank_code,
+                new_items=bank_new_count,
+                refreshed_items=bank_refreshed_count,
+                error_message=bank_error,
+                mode=mode,
+            )
             try:
                 db.log_pipeline_step(
                     run_id=run_id,
@@ -109,26 +181,101 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
                     details={
                         'refreshed_count': bank_refreshed_count,
                         'mode': mode,
+                        'new_count': bank_new_count,
                     }
                 )
             except Exception as e:
                 logger.error(f"Failed to save bank pipeline log for {bank_code}: {e}")
+
+            update_bank(
+                bank_code,
+                state=bank_status,
+                last_run_at=started_at,
+                last_success_at=bank_finished_at if bank_status == 'success' else None,
+                last_failure_at=bank_finished_at if bank_status == 'failed' else None,
+                next_run_at=next_run_at,
+                collection={
+                    'started_at': bank_started_at,
+                    'finished_at': bank_finished_at,
+                    'status': bank_status,
+                    'new_items': bank_new_count,
+                    'updated_items': bank_refreshed_count,
+                    'error': bank_error,
+                    'mode': mode,
+                },
+                analysis={
+                    'started_at': None,
+                    'finished_at': None,
+                    'status': 'pending' if analyze else 'skipped',
+                    'analyzed_items': 0,
+                    'error': None,
+                },
+                sync={
+                    'started_at': None,
+                    'finished_at': None,
+                    'status': 'pending' if sync else 'skipped',
+                    'synced_items': 0,
+                    'error': None,
+                },
+            )
             
     # 3. Apply activity-based member status cleanup globally after collection
+    member_cleanup_perf = time.perf_counter()
+    log_pipeline_job(pipeline_logger, "member_cleanup", "running")
     try:
         from scripts.speech_tracker.migrations.apply_activity_status import apply_activity_based_status
         logger.info("Running activity-based member cleanup...")
         apply_activity_based_status(days_threshold=365)
+        log_pipeline_job(
+            pipeline_logger,
+            "member_cleanup",
+            "success",
+            member_cleanup_perf,
+            days_threshold=365,
+        )
     except Exception as e:
         logger.error(f"Failed to run activity status update: {e}")
+        log_pipeline_job(
+            pipeline_logger,
+            "member_cleanup",
+            "failed",
+            member_cleanup_perf,
+            error_message=str(e),
+        )
+        append_event(
+            {
+                "service": "cb-speeches",
+                "stage": "member_cleanup",
+                "status": "failed",
+                "run_id": run_id,
+                "message": str(e),
+            }
+        )
 
     collection_finished_at = datetime.now().isoformat()
+    update_stage(
+        "collection",
+        started_at=collection_started_at,
+        finished_at=collection_finished_at,
+        status=status,
+        total_new=total_new,
+        total_refreshed=total_refreshed,
+        details=results,
+    )
 
     # Run analysis on new or refreshed speeches
     analysis_started_at = datetime.now().isoformat()
+    analysis_started_perf = time.perf_counter()
     analysis_count = 0
     analysis_status = 'skipped'
     analysis_error = None
+    log_pipeline_job(
+        pipeline_logger,
+        "initial_analysis",
+        "running" if analyze and (total_new > 0 or total_refreshed > 0) else "skipped",
+        analyze_requested=analyze,
+        new_or_refreshed_available=total_new > 0 or total_refreshed > 0,
+    )
     if analyze and (total_new > 0 or total_refreshed > 0):
         try:
             from .analyzer import HawkDoveAnalyzer
@@ -136,6 +283,16 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             analysis_count = analyzer.analyze_pending()
             analysis_status = 'success'
             logger.info(f"Analyzed {analysis_count} speeches")
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": "analysis",
+                    "status": "success",
+                    "run_id": run_id,
+                    "message": "analysis finished",
+                    "analyzed_items": analysis_count,
+                }
+            )
         except ImportError:
             logger.warning("Analyzer not available, skipping analysis")
             analysis_status = 'skipped'
@@ -143,7 +300,24 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             analysis_status = 'failed'
             analysis_error = str(e)
             logger.error(f"Analysis failed: {e}")
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": "analysis",
+                    "status": "failed",
+                    "run_id": run_id,
+                    "message": str(e),
+                }
+            )
     analysis_finished_at = datetime.now().isoformat()
+    log_pipeline_job(
+        pipeline_logger,
+        "initial_analysis",
+        analysis_status,
+        analysis_started_perf,
+        analyzed_items=analysis_count,
+        error_message=analysis_error,
+    )
     db.log_pipeline_step(
         run_id=run_id,
         stage_name='analysis_initial',
@@ -157,24 +331,77 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             'new_or_refreshed_available': total_new > 0 or total_refreshed > 0,
         }
     )
+    update_stage(
+        "analysis",
+        started_at=analysis_started_at,
+        finished_at=analysis_finished_at,
+        status=analysis_status,
+        analyzed_items=analysis_count,
+        error=analysis_error,
+    )
+    for bank_code in target_banks:
+        if bank_code in ALL_SCRAPERS:
+            update_bank(
+                bank_code,
+                analysis={
+                    'started_at': analysis_started_at,
+                    'finished_at': analysis_finished_at,
+                    'status': analysis_status,
+                    'analyzed_items': analysis_count,
+                    'error': analysis_error,
+                },
+            )
 
     # 4. Sync with PostgreSQL
     sync_count = 0
     sync_started_at = datetime.now().isoformat()
+    sync_started_perf = time.perf_counter()
     sync_finished_at = sync_started_at
     sync_status = 'skipped'
     sync_error = None
+    sync_stats = {}
+    log_pipeline_job(
+        pipeline_logger,
+        "collection_sync",
+        "running" if sync else "skipped",
+        sync_requested=sync,
+    )
     if sync:
         try:
             logger.info("Syncing new speeches with PostgreSQL...")
             exporter = PostgreExporter(db=db)
             sync_count = exporter.upload_new_speeches()
+            sync_stats = exporter.last_sync_stats
             sync_status = 'success'
-            logger.info(f"Synced {sync_count} speeches to PostgreSQL")
+            logger.info(f"Synced {sync_count} records to PostgreSQL")
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": "sync",
+                    "status": "success",
+                    "run_id": run_id,
+                    "message": "sync finished",
+                    "synced_items": sync_count,
+                    "source_synced_items": sync_stats.get("source_total", 0),
+                    "tableau_mart_items": sync_stats.get("tableau_marts", 0),
+                    "mart_events_rows": sync_stats.get("mart_counts", {}).get("events", 0),
+                    "mart_daily_rows": sync_stats.get("mart_counts", {}).get("daily", 0),
+                    "mart_plot_rows": sync_stats.get("mart_counts", {}).get("plot", 0),
+                }
+            )
         except Exception as e:
             sync_status = 'failed'
             sync_error = str(e)
             logger.error(f"PostgreSQL sync failed: {e}")
+            append_event(
+                {
+                    "service": "cb-speeches",
+                    "stage": "sync",
+                    "status": "failed",
+                    "run_id": run_id,
+                    "message": str(e),
+                }
+            )
         sync_finished_at = datetime.now().isoformat()
         db.log_pipeline_step(
             run_id=run_id,
@@ -184,8 +411,9 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             status=sync_status,
             item_count=sync_count,
             error_msg=sync_error,
-                details={
-                'synced_speeches': sync_count,
+            details={
+                'synced_records': sync_count,
+                'sync_stats': sync_stats,
             }
         )
     else:
@@ -202,6 +430,42 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
                 'reason': 'sync disabled',
             }
         )
+        append_event(
+            {
+                "service": "cb-speeches",
+                "stage": "sync",
+                "status": "skipped",
+                "run_id": run_id,
+                "message": "sync disabled",
+            }
+        )
+    log_pipeline_job(
+        pipeline_logger,
+        "collection_sync",
+        sync_status,
+        sync_started_perf,
+        synced_items=sync_count,
+        source_synced_items=sync_stats.get("source_total", 0),
+        tableau_mart_items=sync_stats.get("tableau_marts", 0),
+        mart_events_rows=sync_stats.get("mart_counts", {}).get("events", 0),
+        mart_daily_rows=sync_stats.get("mart_counts", {}).get("daily", 0),
+        mart_plot_rows=sync_stats.get("mart_counts", {}).get("plot", 0),
+        error_message=sync_error,
+    )
+    for bank_code in target_banks:
+        if bank_code in ALL_SCRAPERS:
+            update_bank(
+                bank_code,
+                sync={
+                    'started_at': sync_started_at,
+                    'finished_at': sync_finished_at,
+                    'status': sync_status,
+                    'synced_items': sync_count,
+                    'source_synced_items': sync_stats.get("source_total", 0),
+                    'tableau_mart_items': sync_stats.get("tableau_marts", 0),
+                    'error': sync_error,
+                },
+            )
 
     overall_status = status
     for stage_status in (
@@ -226,6 +490,41 @@ def run_collection(banks=None, mode='recent', analyze=True, sync=True, start_yea
             'total_refreshed': total_refreshed,
             'mode': mode,
             'target_banks': target_banks,
+        }
+    )
+    update_status(
+        run_id=run_id,
+        state=overall_status,
+        next_run_at=next_run_at,
+        summary={
+            'total_new': total_new,
+            'total_refreshed': total_refreshed,
+            'analysis_count': analysis_count,
+            'sync_count': sync_count,
+            'status': overall_status,
+        },
+        stages={
+            'collection': {
+                'started_at': collection_started_at,
+                'finished_at': collection_finished_at,
+                'status': status,
+                'total_new': total_new,
+                'total_refreshed': total_refreshed,
+            },
+            'analysis': {
+                'started_at': analysis_started_at,
+                'finished_at': analysis_finished_at,
+                'status': analysis_status,
+                'analyzed_items': analysis_count,
+                'error': analysis_error,
+            },
+            'sync': {
+                'started_at': sync_started_at,
+                'finished_at': sync_finished_at,
+                'status': sync_status,
+                'synced_items': sync_count,
+                'error': sync_error,
+            },
         }
     )
 
@@ -291,7 +590,24 @@ def main():
         print("Starting PostgreSQL sync...")
         exporter = PostgreExporter(db=db)
         count = exporter.upload_new_speeches(limit=1000)
-        print(f"Successfully synced {count} speeches to PostgreSQL")
+        print(f"Successfully synced {count} records to PostgreSQL")
+        if exporter.last_sync_stats:
+            stats = exporter.last_sync_stats
+            mart_counts = stats.get("mart_counts", {})
+            print(
+                "  Source records: "
+                f"{stats.get('source_total', 0)} "
+                f"(members={stats.get('members', 0)}, "
+                f"speeches={stats.get('speeches', 0)}, "
+                f"analysis={stats.get('analysis_results', 0)})"
+            )
+            print(
+                "  Tableau marts: "
+                f"{stats.get('tableau_marts', 0)} "
+                f"(events={mart_counts.get('events', 0)}, "
+                f"daily={mart_counts.get('daily', 0)}, "
+                f"plot={mart_counts.get('plot', 0)})"
+            )
         return
 
     if args.test:

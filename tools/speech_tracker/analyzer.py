@@ -212,8 +212,42 @@ class HawkDoveAnalyzer:
         finally:
             conn.close()
 
+    def revive_skipped_speeches_with_text(self) -> int:
+        """Moves previously skipped speeches back to pending when full text is now available."""
+        conn = self.db._get_conn()
+        try:
+            cursor = conn.execute("""
+                UPDATE analysis_results
+                SET analysis_status = 'pending',
+                    analysis_attempts = 0,
+                    stance_score = NULL,
+                    stance_reason = NULL,
+                    keywords = NULL,
+                    main_risk = NULL,
+                    analyzed_at = NULL,
+                    synced_at = NULL
+                WHERE analysis_status = 'skipped'
+                AND speech_id IN (
+                    SELECT id
+                    FROM speeches
+                    WHERE full_text IS NOT NULL
+                    AND length(full_text) > 500
+                )
+            """)
+            conn.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"Revived {count} skipped speeches with sufficient text for analysis.")
+            return count
+        finally:
+            conn.close()
+
     def analyze_pending(self, limit: int = 50, max_workers: int = 2) -> int:
         """Analyzes un-scored speeches up to the given limit in parallel."""
+        # Some speeches are first collected as placeholders and later refreshed with real text.
+        # Do this before marking short speeches so recovered records can re-enter the queue.
+        self.revive_skipped_speeches_with_text()
+
         # First, mark short speeches so they don't clutter the pending queue
         self.mark_short_speeches_as_skipped()
         
@@ -261,4 +295,3 @@ class HawkDoveAnalyzer:
 
         logger.info(f"Parallel analysis complete. Successfully analyzed {analyzed_count}/{total_to_process} speeches.")
         return analyzed_count
-

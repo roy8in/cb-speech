@@ -9,6 +9,8 @@ import time
 import urllib3
 import io
 import atexit
+import asyncio
+import concurrent.futures
 from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -108,10 +110,44 @@ class BaseScraper(ABC):
             logger.error(f"[{self.BANK_CODE}] Failed to parse PDF: {e}")
             return "Error: Failed to extract text from this PDF document."
 
-    def _get_playwright(self, url, wait_ms=2000):
-        """Use Playwright to get page content, bypassing bot protection and dynamic loading."""
+    def _is_pdf_response(self, url, resp=None, content_type=None):
+        """Return True when a URL or HTTP response points to a PDF."""
+        if url and url.lower().split('?', 1)[0].endswith('.pdf'):
+            return True
+        if content_type is None and resp is not None:
+            content_type = resp.headers.get('Content-Type', '')
+        return 'application/pdf' in (content_type or '').lower()
+
+    def _get_playwright_in_thread(self, url, wait_ms):
+        """Run sync Playwright in a worker thread when the caller owns an asyncio loop."""
         from playwright.sync_api import sync_playwright
         import time
+
+        try:
+            with sync_playwright() as manager:
+                browser = manager.chromium.launch(headless=True)
+                try:
+                    context = browser.new_context(user_agent=self.HEADERS['User-Agent'])
+                    page = context.new_page()
+                    try:
+                        page.goto(url, wait_until='networkidle', timeout=self.REQUEST_TIMEOUT * 1000)
+                        if wait_ms > 0:
+                            time.sleep(wait_ms / 1000)
+                        return page.content()
+                    finally:
+                        page.close()
+                        context.close()
+                finally:
+                    browser.close()
+        except Exception as e:
+            logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
+            return None
+
+    def _get_playwright_sync(self, url, wait_ms):
+        """Use a reusable sync Playwright browser for normal synchronous callers."""
+        from playwright.sync_api import sync_playwright
+        import time
+
         try:
             if self._playwright_manager is None:
                 self._playwright_manager = sync_playwright().start()
@@ -133,6 +169,16 @@ class BaseScraper(ABC):
             logger.error(f"[{self.BANK_CODE}] Playwright failed for {url}: {e}")
             self._close_playwright()
             return None
+
+    def _get_playwright(self, url, wait_ms=2000):
+        """Use Playwright to get page content, bypassing bot protection and dynamic loading."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._get_playwright_sync(url, wait_ms)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(self._get_playwright_in_thread, url, wait_ms).result()
 
     def _close_playwright(self):
         if self._playwright_context is not None:
@@ -302,6 +348,7 @@ class BaseScraper(ABC):
                 date=speech_info['date'],
                 url=speech_info['url'], # Keep original URL for storage
                 full_text=full_text,
+                speech_type=speech_info.get('speech_type', 'speech'),
             )
 
             if speech_id:
@@ -340,6 +387,7 @@ class BaseScraper(ABC):
                 date=speech_info['date'],
                 url=speech_info['url'],
                 full_text=full_text,
+                speech_type=speech_info.get('speech_type', 'speech'),
             )
             if speech_id:
                 new_count += 1

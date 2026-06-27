@@ -8,3 +8,8 @@ __pycache__/
 data/speech_tracker/*.db*
 data/speech_tracker/*.sqlite
 sync.log
+.DS_Store
+logs/*
+!logs/.gitkeep
+state/*.json
+state/*.jsonl

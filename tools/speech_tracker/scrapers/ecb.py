@@ -168,22 +168,38 @@ class ECBScraper(BaseScraper):
             return None  # Text was already captured from CSV
 
         # Check for PDF (often linked directly from RSS)
-        if url.lower().endswith('.pdf'):
+        if self._is_pdf_response(url):
             resp = self._get(url)
-            if resp:
+            if resp and self._is_pdf_response(url, resp):
                 return self.extract_pdf_text(resp.content)
             return None
 
         resp = self._get(url)
         if not resp:
             return None
+        if self._is_pdf_response(url, resp):
+            return self.extract_pdf_text(resp.content)
 
         soup = self._parse_html(resp.text)
-        content = soup.find('div', class_='section') or soup.find('main') or soup.find('article')
+
+        # ECB pages contain several generic "section" blocks before the actual
+        # speech/interview body, including search filters. Prefer <main>, then
+        # choose the longest section as a fallback.
+        content = soup.find('main') or soup.find('article')
+        if not content:
+            sections = soup.find_all('div', class_='section')
+            content = max(
+                sections,
+                key=lambda tag: len(tag.get_text(separator='\n', strip=True)),
+                default=None,
+            )
         if content:
             for tag in content.find_all(['nav', 'script', 'style', 'header', 'footer']):
                 tag.decompose()
-            return content.get_text(separator='\n', strip=True)
+            text = content.get_text(separator='\n', strip=True)
+            if len(text) <= 100 and "Search Options" in text:
+                return None
+            return text
         return None
 
     def collect_new_speeches(self, start_year=None, fetch_text=True):

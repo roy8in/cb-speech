@@ -134,8 +134,7 @@ class FRBScraper(BaseScraper):
         if not resp:
             return None
 
-        content_type = resp.headers.get('Content-Type', '').lower()
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+        if self._is_pdf_response(url, resp):
             return self.extract_pdf_text(resp.content)
 
         try:
