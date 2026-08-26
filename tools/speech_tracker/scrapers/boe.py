@@ -1,23 +1,25 @@
-"""Bank of England speech scraper."""
+"""
+Bank of England (BOE) Speech Scraper
 
-import logging
+Source: https://www.bankofengland.co.uk/news/speeches
+Sitemap: https://www.bankofengland.co.uk/sitemap/speeches
+"""
+
 import re
+import logging
 from datetime import datetime
-
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
 
 
 class BOEScraper(BaseScraper):
-    """Collect Bank of England speeches."""
-
-    BANK_CODE = "BOE"
-    BANK_NAME = "Bank of England"
-    BASE_URL = "https://www.bankofengland.co.uk"
+    BANK_CODE = 'BOE'
+    BANK_NAME = 'Bank of England'
+    BASE_URL = 'https://www.bankofengland.co.uk'
 
     def fetch_speech_list(self, year=None):
-        """Fetch BOE speeches for one year."""
+        """Fetch list of BOE speeches. Prefers /news/speeches for recent years."""
         current_year = datetime.now().year
         if year is None or year >= current_year - 1:
             url = f"{self.BASE_URL}/news/speeches"
@@ -26,296 +28,248 @@ class BOEScraper(BaseScraper):
             url = f"{self.BASE_URL}/sitemap/speeches"
             resp = self._get(url)
             html = resp.text if resp else None
-
+            
         if not html:
-            if "/news/" in url:
-                fallback_url = f"{self.BASE_URL}/sitemap/speeches"
-                resp = self._get(fallback_url)
-                html = resp.text if resp else None
+            # Fallback
+            url = f"{self.BASE_URL}/sitemap/speeches" if "news" in url else f"{self.BASE_URL}/news/speeches"
+            if "news" in url:
+                html = self._get_playwright(url)
             else:
-                fallback_url = f"{self.BASE_URL}/news/speeches"
-                html = self._get_playwright(fallback_url)
-
-        if not html:
-            raise RuntimeError("Failed to load BOE speech listings")
+                resp = self._get(url)
+                html = resp.text if resp else None
+            if not html:
+                return []
 
         soup = self._parse_html(html)
         speeches = []
-        seen_urls = set()
 
-        for link in soup.find_all("a", href=True):
-            href = link["href"]
-            heading = link.find("h3", class_="list")
-            title = (
-                heading.get_text(strip=True)
-                if heading
-                else link.get_text(strip=True)
-            )
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            
+            # Check if this is the new structured format
+            h3_list = link.find('h3', class_='list')
+            if h3_list:
+                title = h3_list.get_text(strip=True)
+            else:
+                title = link.get_text(strip=True)
 
             if not title or len(title) < 10:
                 continue
-            if not any(
-                pattern in href
-                for pattern in ("/speech/", "/speeches/")
-            ):
+
+            if not any(pattern in href for pattern in ['/speech/', '/speeches/']):
                 continue
-            if href in ("/sitemap/speeches", "/news/speeches"):
+            if href == '/sitemap/speeches' or href == '/news/speeches':
                 continue
 
-            if href.startswith("/"):
+            if href.startswith('/'):
                 speech_url = f"{self.BASE_URL}{href}"
-            elif href.startswith("http"):
+            elif href.startswith('http'):
                 speech_url = href
             else:
                 speech_url = f"{self.BASE_URL}/{href}"
 
-            normalized_url = self.normalize_url(speech_url)
-            if normalized_url in seen_urls:
-                continue
-            seen_urls.add(normalized_url)
-
-            time_tag = link.find("time", class_="release-date")
-            if time_tag and time_tag.get("datetime"):
-                date = time_tag["datetime"][:10]
+            # Modern format date extraction
+            time_tag = link.find('time', class_='release-date')
+            if time_tag and time_tag.get('datetime'):
+                date = time_tag['datetime'][:10]
             else:
+                # Initial date from URL (defaults to 1st of the month)
                 date = self._extract_date_from_url(href, year)
 
             if year and date and not date.startswith(str(year)):
                 continue
 
+            # Check if speaker is in the tag
             speaker = None
-            tag = link.find("div", class_="release-tag")
+            tag = link.find('div', class_='release-tag')
             if tag:
                 tag_text = tag.get_text(strip=True)
-                if "//" in tag_text:
-                    speaker = tag_text.split("//")[-1].strip()
+                if '//' in tag_text:
+                    speaker = tag_text.split('//')[-1].strip()
 
             if not speaker:
                 speaker = self.extract_speaker_from_title(title)
 
-            speeches.append(
-                {
-                    "title": title,
-                    "date": date,
-                    "url": speech_url,
-                    "speaker": speaker,
-                }
-            )
+            speeches.append({
+                'title': title,
+                'date': date,
+                'url': speech_url,
+                'speaker': speaker,
+            })
 
-        return speeches
+        # Deduplicate only repeated links from the listing itself. Different
+        # URLs are preserved even when title/date happen to match.
+        unique = {}
+        for speech in speeches:
+            key = self.normalize_url(speech['url'])
+            if key not in unique:
+                unique[key] = speech
+
+        return list(unique.values())
 
     @staticmethod
     def extract_speaker_from_title(title):
-        """Extract a likely speaker name from common BOE title patterns."""
-        clean_title = re.sub(
-            r"\(pdf\s*.*\)",
-            "",
-            title,
-            flags=re.IGNORECASE,
-        ).strip()
-
-        match = re.search(
-            r".+[−–-]\s*(?:speech|remarks|slides|panel remarks|address)"
-            r"\s+by\s+([^−–-]+)$",
-            clean_title,
-            re.IGNORECASE,
-        )
-        if match:
-            return match.group(1).strip()
-
-        if ":" in clean_title:
-            potential = clean_title.split(":", 1)[0].strip()
-            blocked_words = ("at", "the", "meeting", "update")
-            if (
-                1 < len(potential.split()) < 5
-                and not any(
-                    word in potential.lower()
-                    for word in blocked_words
-                )
-            ):
+        clean_title = re.sub(r'\(pdf\s*.*\)', '', title, flags=re.IGNORECASE).strip()
+        m = re.search(r'.+[−–-]\s*(?:speech|remarks|slides|panel remarks|address)\s+by\s+([^−–-]+)$', clean_title, re.IGNORECASE)
+        if m: return m.group(1).strip()
+        if ':' in clean_title:
+            potential = clean_title.split(':')[0].strip()
+            if 1 < len(potential.split()) < 5 and not any(w in potential.lower() for w in ['at', 'the', 'meeting', 'update']):
                 return potential
-
-        match = re.search(
-            r"Slides\s+from\s+([^’']+)[’']s",
-            clean_title,
-            re.IGNORECASE,
-        )
-        if match:
-            return match.group(1).strip()
+        m = re.search(r'Slides\s+from\s+([^’\']+)[’\']s', clean_title, re.IGNORECASE)
+        if m: return m.group(1).strip()
         return None
 
-    @staticmethod
-    def _extract_date_from_url(href, default_year):
-        """Extract an approximate date from BOE URL paths."""
-        match = re.search(r"/(\d{4})/(\w+)/", href)
+    def _extract_date_from_url(self, href, default_year):
+        # Pattern: /YYYY/Month/Slug
+        match = re.search(r'/(\d{4})/(\w+)/', href)
         if match:
             year = match.group(1)
-            month_text = match.group(2).title()
-            for fmt in ("%B", "%b"):
+            month_str = match.group(2).title()
+            # Only treat as month if it's a known month name
+            from .base import BaseScraper # BaseScraper not needed, just using datetime
+            for fmt in ['%B', '%b']:
                 try:
-                    month = datetime.strptime(month_text, fmt).month
+                    month = datetime.strptime(month_str, fmt).month
                     return f"{year}-{month:02d}-01"
                 except ValueError:
                     continue
-
-        match = re.search(r"/(\d{4})/", href)
-        if match:
-            return f"{match.group(1)}-01-01"
+        
+        # Fallback to just year if YYYY is found
+        match_year = re.search(r'/(\d{4})/', href)
+        if match_year:
+            return f"{match_year.group(1)}-01-01"
+            
         if default_year:
             return f"{default_year}-01-01"
-        return ""
+        return ''
 
     def fetch_speech_text(self, url):
-        """Fetch the speech text and attach an exact date when found."""
+        """Fetch the full text and exact date of a BOE speech."""
         content_type = ""
+        # Check headers first to avoid downloading PDFs with playwright
         try:
-            head_resp = self.session.head(
-                url,
-                timeout=self.REQUEST_TIMEOUT,
-                verify=False,
-            )
-            content_type = head_resp.headers.get(
-                "Content-Type",
-                "",
-            ).lower()
-        except Exception:
+            head_resp = self.session.head(url, timeout=self.REQUEST_TIMEOUT, verify=False)
+            content_type = head_resp.headers.get('Content-Type', '').lower()
+        except:
             pass
 
         if self._is_pdf_response(url, content_type=content_type):
             resp = self._get(url)
-            if not resp:
-                return None
-            text = self.extract_pdf_text(resp.content)
-            exact_date = self._extract_date_from_text(text)
-            if exact_date:
-                return f"__DATE__:{exact_date}\n{text}"
-            return text
-
+            if resp:
+                text = self.extract_pdf_text(resp.content)
+                exact_date = self._extract_date_from_text(text)
+                if exact_date:
+                    return f"__DATE__:{exact_date}\n{text}"
+                return text
+            return None
+            
         html = self._get_playwright(url)
+        
+        # Fallback to standard request if Playwright fails
         if not html:
-            logger.info(
-                "[%s] Playwright failed, using standard request for %s",
-                self.BANK_CODE,
-                url,
-            )
+            logger.info(f"[{self.BANK_CODE}] Playwright failed, falling back to standard request for {url}")
             resp = self._get(url)
-            html = resp.text if resp else None
+            if resp:
+                html = resp.text
+        
         if not html:
             return None
-
+            
         try:
             soup = self._parse_html(html)
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to parse HTML for %s: %s",
-                self.BANK_CODE,
-                url,
-                exc,
-            )
+        except Exception as e:
+            logger.warning(f"[{self.BANK_CODE}] Failed to parse HTML for {url}: {e}")
             return None
-
-        exact_date = self._extract_page_date(soup)
-        content = (
-            soup.find("div", class_="page-content")
-            or soup.find("article")
-            or soup.find("div", class_="content-block")
-            or soup.find("main")
-            or soup.find("body")
-        )
-        if not content:
-            return None
-
+        
+        # Extract precise date
+        exact_date = None
+        
+        # 1. Check meta tags (most reliable for older pages)
+        meta_date = soup.find('meta', attrs={'property': 'article:published_time'}) or \
+                    soup.find('meta', attrs={'name': 'date'}) or \
+                    soup.find('meta', attrs={'property': 'og:article:published_time'})
+        if meta_date and meta_date.get('content'):
+            try:
+                # Parse ISO format like '2019-01-24T12:00:00Z'
+                exact_date = meta_date['content'][:10] 
+            except Exception:
+                pass
+                
+        # 2. Check modern published-date div
         if not exact_date:
-            raw_start = content.get_text(
-                separator=" ",
-                strip=True,
-            )[:1000]
-            match = re.search(
-                r"(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})",
-                raw_start,
-            )
-            if match:
+            date_el = soup.find('div', class_='published-date')
+            if date_el:
+                date_text = date_el.get_text(strip=True).replace('Published on', '').strip()
                 try:
-                    exact_date = datetime.strptime(
-                        match.group(1),
-                        "%d %B %Y",
-                    ).strftime("%Y-%m-%d")
+                    dt = datetime.strptime(date_text, '%d %B %Y')
+                    exact_date = dt.strftime('%Y-%m-%d')
                 except ValueError:
                     pass
-
-        for tag in content.find_all(
-            ["nav", "header", "footer", "script", "style", "aside", "button"]
-        ):
-            tag.decompose()
-        text = content.get_text(separator="\n", strip=True)
-
+                    
+        # 3. Check for <time> tags
+        if not exact_date:
+            time_el = soup.find('time')
+            if time_el and time_el.has_attr('datetime'):
+                exact_date = time_el['datetime'][:10]
+                
+        # If exact date found, we could potentially update the DB here, 
+        # but normally we return text. Let's attach date to text for the collector.
+        content_el = (
+            soup.find('div', class_='page-content') or
+            soup.find('article') or
+            soup.find('div', class_='content-block') or
+            soup.find('main') or
+            soup.find('body') # Ultimate fallback for very old pages
+        )
+        
+        text = ""
+        if content_el:
+            # 4. Fallback: Search the first 1000 characters of text for a date
+            if not exact_date:
+                raw_start = content_el.get_text(separator=' ', strip=True)[:1000]
+                # Look for patterns like "12 March 2019" or "March 12, 2019"
+                match = re.search(r'(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})', raw_start)
+                if match:
+                    try:
+                        dt = datetime.strptime(match.group(1), '%d %B %Y')
+                        exact_date = dt.strftime('%Y-%m-%d')
+                    except ValueError:
+                        pass
+                        
+            for tag in content_el.find_all(['nav', 'header', 'footer', 'script', 'style', 'aside', 'button']):
+                tag.decompose()
+            text = content_el.get_text(separator='\n', strip=True)
+            
+        # Meta info hack to pass back to collector if needed
         if exact_date:
             return f"__DATE__:{exact_date}\n{text}"
         return text
 
-    @staticmethod
-    def _extract_page_date(soup):
-        """Extract the publication date from BOE page metadata."""
-        meta_date = (
-            soup.find(
-                "meta",
-                attrs={"property": "article:published_time"},
-            )
-            or soup.find("meta", attrs={"name": "date"})
-            or soup.find(
-                "meta",
-                attrs={"property": "og:article:published_time"},
-            )
-        )
-        if meta_date and meta_date.get("content"):
-            return meta_date["content"][:10]
-
-        date_element = soup.find("div", class_="published-date")
-        if date_element:
-            date_text = date_element.get_text(strip=True).replace(
-                "Published on",
-                "",
-            ).strip()
-            try:
-                return datetime.strptime(
-                    date_text,
-                    "%d %B %Y",
-                ).strftime("%Y-%m-%d")
-            except ValueError:
-                pass
-
-        time_element = soup.find("time")
-        if time_element and time_element.get("datetime"):
-            return time_element["datetime"][:10]
-        return None
-
-    @staticmethod
-    def _extract_date_from_text(text):
-        """Extract a BOE-style date from PDF text."""
+    def _extract_date_from_text(self, text):
+        """Extract a BOE-style speech date from the first page of text."""
         if not text:
             return None
 
         raw_start = text[:2500]
-        patterns = (
-            r"\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b",
-            r"\b([A-Z][a-z]+\s+\d{1,2},\s+\d{4})\b",
-        )
+        patterns = [
+            r'\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b',
+            r'\b([A-Z][a-z]+\s+\d{1,2},\s+\d{4})\b',
+        ]
         for pattern in patterns:
             match = re.search(pattern, raw_start)
             if not match:
                 continue
-            for fmt in ("%d %B %Y", "%B %d, %Y"):
+            date_text = match.group(1)
+            for fmt in ('%d %B %Y', '%B %d, %Y'):
                 try:
-                    return datetime.strptime(
-                        match.group(1),
-                        fmt,
-                    ).strftime("%Y-%m-%d")
+                    return datetime.strptime(date_text, fmt).strftime('%Y-%m-%d')
                 except ValueError:
                     continue
         return None
 
     def get_all_speeches(self, start_year=None, end_year=None):
-        """Fetch BOE speeches year by year instead of only the latest page."""
+        """Fetch BOE speeches year by year for full/backfill mode."""
         return super().get_all_speeches(
             start_year=start_year or 2000,
             end_year=end_year,
