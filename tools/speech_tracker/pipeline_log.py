@@ -1,7 +1,6 @@
-"""
-Structured pipeline logging for the static log viewer.
+"""Structured pipeline logging for the static log viewer.
 
-The log format intentionally follows docs/pipeline-log-viewer.md:
+Log format:
 YYYY-MM-DD HH:MM:SS,mmm | LEVEL | logger | message | key=value, key=value
 """
 
@@ -28,7 +27,8 @@ class EasternFormatter(logging.Formatter):
         dt = datetime.fromtimestamp(record.created, LOG_TZ)
         if datefmt:
             return dt.strftime(datefmt)
-        return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{int(record.msecs):03d}"
+        milliseconds = int(record.msecs)
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + f",{milliseconds:03d}"
 
 
 def _safe_value(value) -> str:
@@ -41,7 +41,10 @@ def _safe_value(value) -> str:
 def _format_extra(extra: dict) -> str:
     if not extra:
         return ""
-    parts = [f"{key}={_safe_value(value)}" for key, value in extra.items()]
+    parts = [
+        f"{key}={_safe_value(value)}"
+        for key, value in extra.items()
+    ]
     return " | " + ", ".join(parts)
 
 
@@ -49,9 +52,16 @@ def setup_run_logging(run_id: str | None = None) -> dict:
     LOG_DIR.mkdir(exist_ok=True)
 
     run_started_at = datetime.now(LOG_TZ)
-    run_id = run_id or f"{run_started_at.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    app_log_path = LOG_DIR / f"app_{run_started_at.strftime('%Y-%m-%d')}.log"
-    summary_log_path = LOG_DIR / f"summary_{run_started_at.strftime('%Y-%m')}.csv"
+    run_id = run_id or (
+        f"{run_started_at.strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    app_log_path = LOG_DIR / (
+        f"app_{run_started_at.strftime('%Y-%m-%d')}.log"
+    )
+    summary_log_path = LOG_DIR / (
+        f"summary_{run_started_at.strftime('%Y-%m')}.csv"
+    )
 
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
@@ -61,14 +71,19 @@ def setup_run_logging(run_id: str | None = None) -> dict:
         logger.removeHandler(handler)
         handler.close()
 
-    formatter = EasternFormatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    formatter = EasternFormatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
 
     file_handler = logging.FileHandler(app_log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        sys.stdout.reconfigure(
+            encoding="utf-8",
+            errors="backslashreplace",
+        )
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
@@ -84,7 +99,12 @@ def setup_run_logging(run_id: str | None = None) -> dict:
     }
 
 
-def log_event(logger: logging.Logger, level: str, message: str, **extra) -> None:
+def log_event(
+    logger: logging.Logger,
+    level: str,
+    message: str,
+    **extra,
+) -> None:
     log_method = getattr(logger, level.lower())
     log_method(f"{message}{_format_extra(extra)}")
 
@@ -104,7 +124,10 @@ def log_pipeline_job(
         "status": status,
     }
     if started_at is not None:
-        payload["duration_sec"] = round(time.perf_counter() - started_at, 3)
+        payload["duration_sec"] = round(
+            time.perf_counter() - started_at,
+            3,
+        )
     payload.update(extra)
     log_event(logger, "info", "Pipeline job status", **payload)
 
@@ -119,7 +142,6 @@ def append_summary(
     total_new: int,
     total_refreshed: int,
     analyzed_items: int,
-    synced_items: int,
     failed_steps: str = "",
 ) -> None:
     summary_log_path.parent.mkdir(exist_ok=True)
@@ -132,10 +154,13 @@ def append_summary(
         "total_new",
         "total_refreshed",
         "analyzed_items",
-        "synced_items",
         "failed_steps",
     ]
-    with summary_log_path.open("a", newline="", encoding="utf-8") as handle:
+    with summary_log_path.open(
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if not exists:
             writer.writeheader()
@@ -148,7 +173,6 @@ def append_summary(
                 "total_new": total_new,
                 "total_refreshed": total_refreshed,
                 "analyzed_items": analyzed_items,
-                "synced_items": synced_items,
                 "failed_steps": failed_steps,
             }
         )
