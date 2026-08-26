@@ -23,24 +23,10 @@ class ECBScraper(BaseScraper):
 
     def fetch_speech_list(self, year=None):
         """
-        Fetch all ECB speeches from the CSV dataset.
+        Fetch ECB speeches from the official CSV dataset.
         If year is specified, filter to that year.
         """
-        speeches = self._fetch_from_csv(year)
-        
-        # If looking for recent speeches, also check the HTML index
-        from datetime import datetime
-        current_year = datetime.now().year
-        if year is None or year >= current_year - 1:
-            recent_html = self.fetch_recent_from_html()
-            # Combine and deduplicate by URL/Logical key
-            existing_urls = {s['url'] for s in speeches}
-            for s in recent_html or []:
-                if s['url'] not in existing_urls:
-                    speeches.append(s)
-                    existing_urls.add(s['url'])
-        
-        return speeches
+        return self._fetch_from_csv(year)
 
     def fetch_recent_speeches(self):
         """Fetch only the latest ECB speeches from the RSS feed."""
@@ -136,6 +122,8 @@ class ECBScraper(BaseScraper):
                     speaker = title.split("Speech by")[-1].split(",")[0].strip()
                 elif "Interview with" in title:
                     speaker = title.split("Interview with")[-1].split(",")[0].strip()
+                elif ':' in title:
+                    speaker = title.split(':', 1)[0].strip()
 
                 speeches.append({
                     'title': title,
@@ -149,6 +137,19 @@ class ECBScraper(BaseScraper):
 
         logger.info(f"[ECB] Found {len(speeches)} speeches from RSS feed")
         return speeches
+
+    @staticmethod
+    def _extract_rss_speaker(title):
+        """Extract a speaker label from current ECB RSS title formats."""
+        if not title:
+            return ""
+        if "Speech by" in title:
+            return title.split("Speech by")[-1].split(",")[0].strip()
+        if "Interview with" in title:
+            return title.split("Interview with")[-1].split(",")[0].strip()
+        if ':' in title:
+            return title.split(':', 1)[0].strip()
+        return ""
 
     def _parse_ecb_date(self, date_str):
         """Parse ECB date format (YYYY-MM-DD or DD/MM/YYYY etc)."""

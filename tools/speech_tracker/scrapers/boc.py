@@ -9,7 +9,7 @@ Multimedia (webcasts) URLs: /multimedia/slug/ (excluded)
 
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,10 @@ class BOCScraper(BaseScraper):
 
             resp = self._get(url)
             if not resp:
+                if page == 1:
+                    raise RuntimeError(
+                        f"Failed to fetch BOC speeches page: {url}"
+                    )
                 break
 
             soup = self._parse_html(resp.text)
@@ -274,23 +278,38 @@ class BOCScraper(BaseScraper):
         """Collect current-year BOC speeches and refresh changed existing rows."""
         current_year = datetime.now().year
         existing_urls = self.db.get_existing_urls(self.BANK_CODE)
-        norm_existing_urls = {self.normalize_url(u) for u in existing_urls}
+        existing_by_normalized_url = {
+            self.normalize_url(url): url for url in existing_urls
+        }
 
         speech_list = self.fetch_speech_list(year=current_year)
         if not speech_list:
+            existing_count = self.db.count_speeches_for_year(
+                self.BANK_CODE, current_year
+            )
+            if existing_count > 0:
+                raise RuntimeError(
+                    f"{self.BANK_CODE} scraper returned 0 speeches for "
+                    f"{current_year}, but SQLite already contains "
+                    f"{existing_count}."
+                )
             return 0
 
         new_count = 0
         refreshed_count = 0
         for speech_info in speech_list:
             url = self.normalize_url(speech_info['url'])
-            if url in norm_existing_urls:
-                if self._refresh_existing_speech(speech_info, fetch_text=fetch_text):
+            stored_url = existing_by_normalized_url.get(url)
+            if stored_url:
+                if self._refresh_existing_speech(
+                    speech_info,
+                    stored_url=stored_url,
+                    fetch_text=fetch_text,
+                ):
                     refreshed_count += 1
                 continue
 
-            if self.is_logical_duplicate(self.BANK_CODE, speech_info['title'], speech_info['date']):
-                continue
+            existing_by_normalized_url[url] = speech_info['url']
 
             full_text = None
             if fetch_text:
@@ -312,7 +331,12 @@ class BOCScraper(BaseScraper):
             logger.info(f"[{self.BANK_CODE}] Refreshed {refreshed_count} existing recent speeches")
         return new_count
 
-    def _refresh_existing_speech(self, speech_info, fetch_text=True):
+    def _refresh_existing_speech(
+        self,
+        speech_info,
+        stored_url,
+        fetch_text=True,
+    ):
         """Refresh metadata/text for an existing BOC URL when the page changed."""
         conn = self.db._get_conn()
         try:
@@ -323,7 +347,7 @@ class BOCScraper(BaseScraper):
                 LEFT JOIN members m ON s.speaker_id = m.id
                 WHERE s.url = ?
                 """,
-                (speech_info['url'],),
+                (stored_url,),
             ).fetchone()
         finally:
             conn.close()
@@ -332,43 +356,59 @@ class BOCScraper(BaseScraper):
             return False
 
         desired_type = speech_info.get('speech_type', 'speech')
+        desired_speaker = speech_info.get('speaker')
         dirty_text = self._looks_like_dirty_boc_text(row['full_text'])
         metadata_changed = (
             row['title'] != speech_info['title']
             or row['date'] != speech_info['date']
             or row['speech_type'] != desired_type
-            or row['speaker'] != speech_info.get('speaker')
+            or row['speaker'] != desired_speaker
         )
 
         if not metadata_changed and not dirty_text:
             return False
 
         full_text = row['full_text']
+        fetched_text = None
         if fetch_text and (dirty_text or metadata_changed):
-            full_text = self.fetch_speech_text(speech_info['url']) or full_text
+            fetched_text = self.fetch_speech_text(speech_info['url'])
+            if fetched_text:
+                full_text = fetched_text
 
-        speaker_id = self.db.get_or_create_member(self.BANK_CODE, speech_info.get('speaker'))
+        if dirty_text and not metadata_changed and not fetched_text:
+            return False
+
+        content_changed = (
+            full_text != row['full_text']
+            or row['date'] != speech_info['date']
+        )
+        if content_changed:
+            self.db.update_speech_content(
+                row['id'],
+                full_text,
+                speech_info['date'],
+            )
+
+        speaker_id = self.db.get_or_create_member(
+            self.BANK_CODE,
+            desired_speaker,
+        )
         conn = self.db._get_conn()
         try:
             conn.execute(
                 """
                 UPDATE speeches
                 SET title = ?,
-                    date = ?,
                     speaker_id = ?,
-                    full_text = ?,
                     speech_type = ?,
-                    fetched_at = ?,
-                    synced_at = NULL
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     speech_info['title'],
-                    speech_info['date'],
                     speaker_id,
-                    full_text,
                     desired_type,
-                    datetime.now().isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
                     row['id'],
                 ),
             )

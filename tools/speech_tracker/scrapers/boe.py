@@ -97,22 +97,15 @@ class BOEScraper(BaseScraper):
                 'speaker': speaker,
             })
 
-        # Handle duplicates (e.g., HTML vs PDF for the same speech)
-        # We prefer HTML over PDF
-        key_map = {}
-        for s in speeches:
-            # Use title and date as a logical key to identify the same speech
-            key = (s['title'].strip().lower(), s['date'])
-            if key not in key_map:
-                key_map[key] = s
-            else:
-                # If current is HTML and existing is PDF, replace
-                is_current_pdf = s['url'].lower().endswith('.pdf')
-                is_existing_pdf = key_map[key]['url'].lower().endswith('.pdf')
-                if is_existing_pdf and not is_current_pdf:
-                    key_map[key] = s
+        # Deduplicate only repeated links from the listing itself. Different
+        # URLs are preserved even when title/date happen to match.
+        unique = {}
+        for speech in speeches:
+            key = self.normalize_url(speech['url'])
+            if key not in unique:
+                unique[key] = speech
 
-        return list(key_map.values())
+        return list(unique.values())
 
     @staticmethod
     def extract_speaker_from_title(title):
@@ -276,9 +269,8 @@ class BOEScraper(BaseScraper):
         return None
 
     def get_all_speeches(self, start_year=None, end_year=None):
-        all_speeches = self.fetch_speech_list()
-        if start_year:
-            all_speeches = [s for s in all_speeches if s['date'] >= f"{start_year}-01-01"]
-        if end_year:
-            all_speeches = [s for s in all_speeches if s['date'] <= f"{end_year}-12-31"]
-        return all_speeches
+        """Fetch BOE speeches year by year for full/backfill mode."""
+        return super().get_all_speeches(
+            start_year=start_year or 2000,
+            end_year=end_year,
+        )

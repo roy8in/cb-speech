@@ -47,6 +47,27 @@ class FRBScraper(BaseScraper):
         finally:
             conn.close()
 
+    def _speaker_from_context(self, link):
+        """Extract the full speaker label printed beside a list item."""
+        container = link.find_parent(['div', 'li', 'article']) or link.parent
+        if not container:
+            return None
+
+        prefixes = [
+            'Vice Chair for Supervision ',
+            'Vice Chair ',
+            'Chair ',
+            'Governor ',
+        ]
+        for line in container.get_text('\n', strip=True).splitlines():
+            clean_line = ' '.join(line.split())
+            for prefix in prefixes:
+                if clean_line.startswith(prefix):
+                    speaker = clean_line[len(prefix):].strip()
+                    if speaker:
+                        return speaker
+        return None
+
     def fetch_speech_list(self, year=None):
         """Fetch list of Fed speeches for a given year."""
         if year is None:
@@ -92,24 +113,13 @@ class FRBScraper(BaseScraper):
             else:
                 date = f"{year}-01-01"
 
-            # Extract speaker from URL or title
-            speaker = None
-            speaker_match = re.search(r'/speech/([a-z]+)\d{8}', href)
-            if speaker_match:
-                speaker_slug = speaker_match.group(1).title()
-                speaker = self._lookup_speaker(speaker_slug)
-
-            # Try to extract from surrounding text (date/speaker in parent)
-            parent = link.parent
-            if parent and not speaker:
-                parent_text = parent.get_text()
-                for pattern in [
-                    r'(?:Governor|Chair|Vice Chair)\s+(\w+(?:\s+\w+)?)',
-                ]:
-                    m = re.search(pattern, parent_text)
-                    if m:
-                        speaker = m.group(1)
-                        break
+            # Prefer the full speaker name printed on the list page.
+            speaker = self._speaker_from_context(link)
+            if not speaker:
+                speaker_match = re.search(r'/speech/([a-z]+)\d{8}', href)
+                if speaker_match:
+                    speaker_slug = speaker_match.group(1).title()
+                    speaker = self._lookup_speaker(speaker_slug)
 
             speeches.append({
                 'title': title,

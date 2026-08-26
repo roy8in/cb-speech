@@ -122,12 +122,12 @@ class BOJScraper(BaseScraper):
         return name
 
     def _dedupe_speeches(self, speeches):
-        # Handle Full Text vs Summary
+        # Handle Full Text vs Summary for the same speaker/event.
         key_map = {}
         for s in speeches:
             # Normalize title for key: remove " (Summary)" or " (Full Text)"
             clean_title = re.sub(r'\s*\((?:Summary|Outline|Full Text)\)', '', s['title'], flags=re.IGNORECASE).strip().lower()
-            key = (clean_title, s['date'])
+            key = (clean_title, s['date'], s.get('speaker') or '')
             
             if key not in key_map:
                 key_map[key] = s

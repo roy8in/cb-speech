@@ -232,6 +232,23 @@ class BaseScraper(ABC):
         """
         pass
 
+    @staticmethod
+    def _extract_embedded_metadata(full_text):
+        """Strip __DATE__/__SPEAKER__ markers from fetched text."""
+        if not full_text:
+            return full_text, {}
+
+        metadata = {}
+        text_lines = []
+        for line in full_text.split("\n"):
+            if line.startswith("__DATE__:"):
+                metadata['date'] = line.replace("__DATE__:", "", 1).strip()
+            elif line.startswith("__SPEAKER__:"):
+                metadata['speaker'] = line.replace("__SPEAKER__:", "", 1).strip()
+            else:
+                text_lines.append(line)
+        return "\n".join(text_lines).strip(), metadata
+
     def refresh_incomplete_speeches(self):
         """Find and re-fetch speeches that were incomplete or placeholders."""
         incomplete = self.db.get_incomplete_speeches(self.BANK_CODE)
@@ -242,13 +259,10 @@ class BaseScraper(ABC):
         for item in incomplete:
             logger.info(f"[{self.BANK_CODE}] Refreshing: {item['title']} ({item['url']})")
             full_text = self.fetch_speech_text(item['url'])
+            full_text, metadata = self._extract_embedded_metadata(full_text)
             
             if full_text:
-                exact_date = None
-                if full_text.startswith("__DATE__:"):
-                    parts = full_text.split("\n", 1)
-                    exact_date = parts[0].replace("__DATE__:", "").strip()
-                    full_text = parts[1].strip() if len(parts) > 1 else ""
+                exact_date = metadata.get('date')
 
                 # Only update if we actually got real content now
                 if len(full_text) > 500 and "to be published" not in full_text.lower():
@@ -310,25 +324,15 @@ class BaseScraper(ABC):
                 continue
             norm_existing_urls.add(url)
 
-            full_text = None
-            if fetch_text:
+            full_text = speech_info.get('_full_text')
+            if fetch_text and not full_text:
                 full_text = self.fetch_speech_text(speech_info['url'])
-                
-                # Check for embedded metadata from specific scrapers
-                if full_text:
-                    lines = full_text.split("\n")
-                    new_text_lines = []
-                    for line in lines:
-                        if line.startswith("__DATE__:"):
-                            speech_info['date'] = line.replace("__DATE__:", "").strip()
-                        elif line.startswith("__SPEAKER__:"):
-                            speech_info['speaker'] = line.replace("__SPEAKER__:", "").strip()
-                        else:
-                            new_text_lines.append(line)
-                    full_text = "\n".join(new_text_lines).strip()
 
-                if full_text:
-                    logger.info(f"[{self.BANK_CODE}] Fetched: {speech_info['title'][:60]}...")
+            full_text, metadata = self._extract_embedded_metadata(full_text)
+            speech_info.update(metadata)
+
+            if full_text:
+                logger.info(f"[{self.BANK_CODE}] Fetched: {speech_info['title'][:60]}...")
 
             speech_id = self.db.insert_speech(
                 bank_code=self.BANK_CODE,
@@ -372,9 +376,12 @@ class BaseScraper(ABC):
                 continue
             norm_existing_urls.add(url)
 
-            full_text = speech_info.pop('_full_text', None)
+            full_text = speech_info.get('_full_text')
             if fetch_text and not full_text:
                 full_text = self.fetch_speech_text(speech_info['url'])
+
+            full_text, metadata = self._extract_embedded_metadata(full_text)
+            speech_info.update(metadata)
 
             speech_id = self.db.insert_speech(
                 bank_code=self.BANK_CODE,
