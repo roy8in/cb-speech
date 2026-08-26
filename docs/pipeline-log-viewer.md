@@ -3,15 +3,16 @@
 `log-viewer/`는 중앙은행 speech 파이프라인의 로컬 실행 로그를 확인하기 위한
 정적 웹 페이지다.
 
-현재 pipeline 단계는 다음과 같다.
+신규 pipeline 단계는 다음과 같다.
 
 1. Prepare
 2. Collect
-3. Maintenance
-4. Analyze
-5. Finish
+3. Analyze
+4. Finish
 
-PostgreSQL sync와 Tableau mart 단계는 더 이상 표시하지 않는다.
+PostgreSQL sync, Tableau mart, inactivity 기반 member cleanup 단계는 더 이상
+실행하지 않는다. 기존 log viewer의 Maintenance column은 과거 로그 호환을 위해
+남아 있을 수 있지만 신규 실행에는 job이 생성되지 않는다.
 
 ## 실행
 
