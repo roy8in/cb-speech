@@ -39,32 +39,46 @@ class StanceResult(BaseModel):
     )
 
 
-SYSTEM_PROMPT = """You are a monetary policy analyst specializing in central bank communications.
+SYSTEM_PROMPT = """You are a monetary policy analyst specializing in
+central bank communications.
 
-TASK: Read the speech and determine the speaker's monetary policy stance, key economic concepts, and the primary risk identified.
+TASK: Read the speech and determine the speaker's monetary policy stance,
+key economic concepts, and the primary risk identified.
 
 SCORING rubric:
  -1.0: Explicitly calls for immediate rate cuts or emergency easing
- -0.7: Strongly emphasizes downside risks, recession fears, need for accommodation
- -0.5: Leans dovish — highlights slowing growth, labor market weakness, or subdued inflation
- -0.3: Mildly dovish — acknowledges risks but suggests patience before tightening
-  0.0: Neutral — balanced assessment of risks with no clear directional bias
-  null: No monetary policy signal (regulation, financial stability, payments, CBDC, history, etc.)
+ -0.7: Strongly emphasizes downside risks, recession fears, and the need
+       for accommodation
+ -0.5: Leans dovish — highlights slowing growth, labor market weakness,
+       or subdued inflation
+ -0.3: Mildly dovish — acknowledges risks but suggests patience before
+       tightening
+  0.0: Neutral — balanced assessment with no clear directional bias
+  null: No monetary policy signal, such as regulation, financial stability,
+        payments, CBDC, or history
   0.3: Mildly hawkish — notes inflation persistence, suggests vigilance
-  0.5: Leans hawkish — warns of inflation risks, hints at tightening or holding rates high
-  0.7: Strongly hawkish — advocates for rate hikes, emphasizes inflation fighting
+  0.5: Leans hawkish — warns of inflation risks, hints at tightening or
+       holding rates high
+  0.7: Strongly hawkish — advocates for rate hikes and emphasizes
+       inflation fighting
   1.0: Explicitly calls for immediate rate hikes or aggressive tightening
 
 INSTRUCTIONS:
-1. Identify key phrases that reveal the speaker's policy stance and map them to the rubric.
-2. Provide a 2-3 sentence 'stance_reason' citing specific evidence for the score.
-3. Extract up to 15 key economic concepts. Each concept must be mapped strictly to one of the following 12 categories: [Inflation, Inflation Expectations, Labor Market, Economic Growth, Supply Side/Productivity, Financial Stability, Housing Market, Monetary Policy, Global Economy, Fiscal Policy, Energy & Commodities, Other].
-4. Use the 'Other' category only if the concept cannot be logically placed within the first 11 categories.
-5. Structure keywords as: {"category": "Category Name", "detail": "Specific indicator or metric"}.
-6. Identify the 'Main Risk': The single most significant threat to achieving policy goals discussed.
+1. Identify phrases that reveal the policy stance and map them to the rubric.
+2. Provide a 2-3 sentence stance_reason citing specific evidence.
+3. Extract up to 15 key economic concepts. Map each concept strictly to
+   one of these categories: Inflation, Inflation Expectations, Labor Market,
+   Economic Growth, Supply Side/Productivity, Financial Stability,
+   Housing Market, Monetary Policy, Global Economy, Fiscal Policy,
+   Energy & Commodities, Other.
+4. Use Other only if the concept cannot fit in the first 11 categories.
+5. Structure keywords as objects with category and detail fields.
+6. Identify Main Risk: the single most significant threat to achieving
+   policy goals discussed.
 7. If no monetary policy signals exist, set stance_score to null.
 
-OUTPUT: A JSON object with exactly four keys: "stance_score", "stance_reason", "keywords", "main_risk".
+OUTPUT: A JSON object with exactly four keys: stance_score, stance_reason,
+keywords, and main_risk.
 """
 
 
@@ -249,7 +263,7 @@ class HawkDoveAnalyzer:
                     CASE
                         WHEN s.full_text IS NULL
                         THEN 'Skipped: Missing full text.'
-                        ELSE 'Skipped: Text too short for meaningful analysis (<= 500 chars).'
+                        ELSE 'Skipped: Text too short (<= 500 chars).'
                     END,
                     '[]'
                 FROM speeches s
@@ -393,7 +407,8 @@ class HawkDoveAnalyzer:
                     logger.error("Worker thread failed: %s", exc)
 
         logger.info(
-            "Parallel analysis complete. Successfully analyzed %s/%s speeches.",
+            "Parallel analysis complete. "
+            "Successfully analyzed %s/%s speeches.",
             analyzed_count,
             len(rows),
         )
