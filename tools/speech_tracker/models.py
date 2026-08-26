@@ -30,7 +30,9 @@ def backup_sqlite_database(db_path=None):
     backup_dir = source_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     date_label = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    backup_path = backup_dir / f"speeches_{date_label}.db"
+    backup_path = backup_dir / (
+        f"{source_path.stem}_{date_label}{source_path.suffix}"
+    )
     if backup_path.exists():
         return backup_path
 
@@ -50,6 +52,7 @@ class SpeechDB:
     def __init__(self, db_path=None):
         self.db_path = str(db_path or get_db_path())
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.backup_path = backup_sqlite_database(self.db_path)
         self._init_db()
 
     def _get_conn(self):
@@ -574,29 +577,64 @@ class SpeechDB:
             conn.close()
 
     def update_speech_content(self, speech_id, full_text, exact_date=None):
-        """Update recovered speech text and its change timestamp."""
-        now = utc_now_iso()
+        """Update speech text and invalidate analysis when source data changes."""
         conn = self._get_conn()
         try:
-            if exact_date:
-                conn.execute(
-                    """
-                    UPDATE speeches
-                    SET full_text = ?, date = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (full_text, exact_date, now, speech_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE speeches
-                    SET full_text = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (full_text, now, speech_id),
-                )
+            row = conn.execute(
+                "SELECT full_text, date FROM speeches WHERE id = ?",
+                (speech_id,),
+            ).fetchone()
+            if row is None:
+                return False
+
+            new_date = exact_date or row["date"]
+            if row["full_text"] == full_text and row["date"] == new_date:
+                return False
+
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE speeches
+                SET full_text = ?, date = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (full_text, new_date, now, speech_id),
+            )
+            conn.execute(
+                """
+                UPDATE analysis_results
+                SET stance_score = NULL,
+                    stance_reason = NULL,
+                    keywords = NULL,
+                    main_risk = NULL,
+                    analysis_attempts = 0,
+                    analysis_status = 'pending',
+                    analyzed_at = NULL,
+                    model_name = NULL,
+                    analysis_version = NULL
+                WHERE speech_id = ?
+                """,
+                (speech_id,),
+            )
             conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def count_speeches_for_year(self, bank_code, year):
+        """Return stored speech count for one bank and calendar year."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM speeches
+                WHERE bank_code = ?
+                  AND substr(date, 1, 4) = ?
+                """,
+                (bank_code, str(year)),
+            ).fetchone()
+            return int(row["count"])
         finally:
             conn.close()
 
