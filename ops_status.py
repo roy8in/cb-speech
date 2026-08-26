@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -11,7 +11,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 STATE_DIR = ROOT_DIR / "state"
 STATUS_PATH = STATE_DIR / "cb_speeches_status.json"
 EVENT_PATH = STATE_DIR / "cb_speeches_events.jsonl"
-KST = ZoneInfo("Asia/Seoul")
 EASTERN = ZoneInfo("America/New_York")
 DEFAULT_SERVICE = "cb-speeches"
 DEFAULT_ENVIRONMENT = "home"
@@ -24,7 +23,8 @@ BANKS = ("FRB", "ECB", "BOE", "BOJ", "RBA", "BOC")
 
 
 def now() -> datetime:
-    return datetime.now(KST)
+    """Return the current UTC time."""
+    return datetime.now(timezone.utc)
 
 
 def iso(value: datetime | None = None) -> str:
@@ -102,6 +102,7 @@ def ensure_status() -> dict:
     status.setdefault("summary", {})
     status.setdefault("stages", {})
     status["stages"].pop("sync", None)
+    status["stages"].pop("member_cleanup", None)
     status.setdefault("banks", {bank: {} for bank in BANKS})
 
     for bank in BANKS:
