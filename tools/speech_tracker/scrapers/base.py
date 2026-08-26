@@ -252,9 +252,14 @@ class BaseScraper(ABC):
 
                 # Only update if we actually got real content now
                 if len(full_text) > 500 and "to be published" not in full_text.lower():
-                    self.db.update_speech_content(item['id'], full_text, exact_date)
-                    refreshed_count += 1
-                    logger.info(f"[{self.BANK_CODE}] Successfully refreshed ID {item['id']}")
+                    changed = self.db.update_speech_content(
+                        item['id'], full_text, exact_date
+                    )
+                    if changed:
+                        refreshed_count += 1
+                        logger.info(
+                            f"[{self.BANK_CODE}] Successfully refreshed ID {item['id']}"
+                        )
             
         return refreshed_count
 
@@ -288,19 +293,6 @@ class BaseScraper(ABC):
         if '?' in url: url = url.split('?')[0]
         return url
 
-    def is_logical_duplicate(self, bank_code, title, date):
-        """Check if a speech with same title and date already exists for this bank."""
-        conn = self.db._get_conn()
-        try:
-            # Using EXACT match for title but stripped
-            row = conn.execute(
-                "SELECT id FROM speeches WHERE bank_code = ? AND title = ? AND date = ?",
-                (bank_code, title.strip(), date)
-            ).fetchone()
-            return row is not None
-        finally:
-            conn.close()
-
     def collect_new_speeches(self, start_year=None, fetch_text=True):
         """
         Main collection method: fetch new speeches and save to DB.
@@ -316,10 +308,7 @@ class BaseScraper(ABC):
             url = self.normalize_url(speech_info['url'])
             if url in norm_existing_urls:
                 continue
-                
-            # Pre-emptive logical duplicate check
-            if self.is_logical_duplicate(self.BANK_CODE, speech_info['title'], speech_info['date']):
-                continue
+            norm_existing_urls.add(url)
 
             full_text = None
             if fetch_text:
@@ -365,6 +354,15 @@ class BaseScraper(ABC):
 
         speech_list = self.fetch_speech_list(year=current_year)
         if not speech_list:
+            existing_count = self.db.count_speeches_for_year(
+                self.BANK_CODE, current_year
+            )
+            if existing_count > 0:
+                raise RuntimeError(
+                    f"{self.BANK_CODE} scraper returned 0 speeches for "
+                    f"{current_year}, but SQLite already contains "
+                    f"{existing_count}."
+                )
             return 0
 
         new_count = 0
@@ -372,9 +370,7 @@ class BaseScraper(ABC):
             url = self.normalize_url(speech_info['url'])
             if url in norm_existing_urls:
                 continue
-            
-            if self.is_logical_duplicate(self.BANK_CODE, speech_info['title'], speech_info['date']):
-                continue
+            norm_existing_urls.add(url)
 
             full_text = speech_info.pop('_full_text', None)
             if fetch_text and not full_text:

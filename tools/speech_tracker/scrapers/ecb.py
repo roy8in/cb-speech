@@ -35,7 +35,7 @@ class ECBScraper(BaseScraper):
             recent_html = self.fetch_recent_from_html()
             # Combine and deduplicate by URL/Logical key
             existing_urls = {s['url'] for s in speeches}
-            for s in recent_html:
+            for s in recent_html or []:
                 if s['url'] not in existing_urls:
                     speeches.append(s)
                     existing_urls.add(s['url'])
@@ -95,15 +95,19 @@ class ECBScraper(BaseScraper):
         url = "https://www.ecb.europa.eu/rss/press.html"
         resp = self._get(url)
         if not resp:
-            return []
+            return None
 
         speeches = []
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(resp.text)
+            items = root.findall('.//item')
+            if not items:
+                logger.error("[ECB] RSS parsed but contained no items")
+                return None
             
             from datetime import datetime
-            for item in root.findall('.//item'):
+            for item in items:
                 link_node = item.find('link')
                 if link_node is None or not link_node.text: continue
                 href = link_node.text.strip()
@@ -141,6 +145,7 @@ class ECBScraper(BaseScraper):
                 })
         except Exception as e:
             logger.error(f"[ECB] Error parsing RSS feed: {e}")
+            return None
 
         logger.info(f"[ECB] Found {len(speeches)} speeches from RSS feed")
         return speeches
@@ -214,6 +219,7 @@ class ECBScraper(BaseScraper):
             url = speech_info['url']
             if url in existing_urls:
                 continue
+            existing_urls.add(url)
 
             full_text = speech_info.pop('_full_text', None)
             
@@ -246,12 +252,15 @@ class ECBScraper(BaseScraper):
         """
         existing_urls = self.db.get_existing_urls(self.BANK_CODE)
         speech_list = self.fetch_recent_speeches()
+        if speech_list is None:
+            raise RuntimeError("ECB recent RSS could not be fetched or parsed")
 
         new_count = 0
         for speech_info in speech_list:
             url = speech_info['url']
             if url in existing_urls:
                 continue
+            existing_urls.add(url)
 
             full_text = None
             if fetch_text:
