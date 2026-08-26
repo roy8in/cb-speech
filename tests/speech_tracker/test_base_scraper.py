@@ -26,15 +26,16 @@ class FakeScraper(BaseScraper):
     BANK_NAME = "Test Bank"
     BASE_URL = "https://example.com"
 
-    def __init__(self, db, speech_list):
+    def __init__(self, db, speech_list, fetched_text=None):
         self.speech_list = speech_list
+        self.fetched_text = fetched_text or ("x" * 600)
         super().__init__(db=db)
 
     def fetch_speech_list(self, year=None):
         return list(self.speech_list)
 
     def fetch_speech_text(self, url):
-        return "x" * 600
+        return self.fetched_text
 
 
 def test_recent_zero_result_fails_for_populated_year():
@@ -71,3 +72,29 @@ def test_same_title_and_date_with_different_urls_are_kept():
         "https://example.com/a",
         "https://example.com/b",
     ]
+
+
+def test_recent_collection_applies_embedded_metadata():
+    current_year = datetime.now().year
+    speech = {
+        "title": "Policy Speech",
+        "date": f"{current_year}-08-01",
+        "url": "https://example.com/policy-speech",
+        "speaker": None,
+    }
+    fetched_text = (
+        f"__DATE__:{current_year}-08-25\n"
+        "__SPEAKER__:Actual Speaker\n"
+        + ("Policy text. " * 60)
+    )
+    db = FakeDB()
+    scraper = FakeScraper(db, [speech], fetched_text=fetched_text)
+
+    count = scraper.collect_recent(fetch_text=True)
+
+    assert count == 1
+    inserted = db.inserted[0]
+    assert inserted["date"] == f"{current_year}-08-25"
+    assert inserted["speaker"] == "Actual Speaker"
+    assert "__DATE__" not in inserted["full_text"]
+    assert "__SPEAKER__" not in inserted["full_text"]
