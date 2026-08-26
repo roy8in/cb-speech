@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,7 +15,11 @@ KST = ZoneInfo("Asia/Seoul")
 EASTERN = ZoneInfo("America/New_York")
 DEFAULT_SERVICE = "cb-speeches"
 DEFAULT_ENVIRONMENT = "home"
-DEFAULT_HOST = os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "unknown")
+DEFAULT_HOST = (
+    os.uname().nodename
+    if hasattr(os, "uname")
+    else os.environ.get("COMPUTERNAME", "unknown")
+)
 BANKS = ("FRB", "ECB", "BOE", "BOJ", "RBA", "BOC")
 
 
@@ -29,14 +33,18 @@ def iso(value: datetime | None = None) -> str:
 
 def next_daily_eastern_run(value: datetime | None = None) -> str:
     current = (value or now()).astimezone(EASTERN)
-    candidate = datetime.combine(current.date(), time(20, 0), tzinfo=EASTERN)
+    candidate = datetime.combine(
+        current.date(),
+        time(20, 0),
+        tzinfo=EASTERN,
+    )
     if current >= candidate:
         candidate += timedelta(days=1)
     return candidate.isoformat()
 
 
 def next_three_hour_run(value: datetime | None = None) -> str:
-    """Backward-compatible name; schedule is now daily at 20:00 America/New_York."""
+    """Backward-compatible alias for the daily Eastern schedule."""
     return next_daily_eastern_run(value)
 
 
@@ -52,7 +60,10 @@ def _read_json(path: Path) -> dict:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     tmp_path.replace(path)
 
 
@@ -80,12 +91,23 @@ def ensure_status() -> dict:
     status.setdefault("state", "idle")
     status.setdefault("generated_at", iso())
     status.setdefault("next_run_at", next_daily_eastern_run())
-    status.setdefault("schedule", {"timezone": "America/New_York", "time": "20:00", "frequency": "daily"})
+    status.setdefault(
+        "schedule",
+        {
+            "timezone": "America/New_York",
+            "time": "20:00",
+            "frequency": "daily",
+        },
+    )
     status.setdefault("summary", {})
     status.setdefault("stages", {})
+    status["stages"].pop("sync", None)
     status.setdefault("banks", {bank: {} for bank in BANKS})
+
     for bank in BANKS:
         status["banks"].setdefault(bank, {})
+        status["banks"][bank].pop("sync", None)
+
     return status
 
 
@@ -120,6 +142,17 @@ def update_stage(stage_name: str, **fields) -> dict:
 
 
 def _aggregate_state(banks: dict) -> str:
-    order = {"failed": 4, "partial": 3, "running": 2, "success": 1, "skipped": 0, "idle": 0}
-    ranked = sorted((bank.get("state", "idle") for bank in banks.values()), key=lambda s: order.get(s, 0), reverse=True)
+    order = {
+        "failed": 4,
+        "partial": 3,
+        "running": 2,
+        "success": 1,
+        "skipped": 0,
+        "idle": 0,
+    }
+    ranked = sorted(
+        (bank.get("state", "idle") for bank in banks.values()),
+        key=lambda state: order.get(state, 0),
+        reverse=True,
+    )
     return ranked[0] if ranked else "idle"
