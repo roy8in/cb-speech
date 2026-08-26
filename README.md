@@ -12,6 +12,7 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 ## 주요 경로
 
 - `data/speech_tracker/speeches.db`: 로컬 SQLite 데이터베이스
+- `data/speech_tracker/backups/`: 일별 SQLite snapshot
 - `tools/speech_tracker/scrapers/`: 중앙은행별 스크레이퍼
 - `tools/speech_tracker/models.py`: SQLite 스키마와 DB 접근 함수
 - `tools/speech_tracker/analyzer.py`: Gemini 기반 통화정책 성향 분석
@@ -24,16 +25,29 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 
 ## 데이터 흐름
 
-1. 중앙은행 홈페이지에서 연설 목록과 본문을 수집합니다.
-2. 새 연설은 SQLite `speeches`에 저장합니다.
-3. 기존 연설 중 본문이 비어 있거나 불완전한 최근 항목은 다시 확인합니다.
-4. Gemini가 분석 가능한 연설을 평가합니다.
-5. 결과는 SQLite `analysis_results`에 저장합니다.
-6. 실행 상태와 단계별 로그는 SQLite `pipeline_logs`, `state/`, `logs/`에
+1. 일일 runner가 기존 SQLite DB의 snapshot을 먼저 만듭니다.
+2. 중앙은행 홈페이지에서 연설 목록과 본문을 수집합니다.
+3. 새 연설은 SQLite `speeches`에 저장합니다.
+4. 기존 연설 중 본문이 비어 있거나 불완전한 최근 항목은 다시 확인합니다.
+5. Gemini가 분석 가능한 연설을 평가합니다.
+6. 결과는 SQLite `analysis_results`에 저장합니다.
+7. 실행 상태와 단계별 로그는 SQLite `pipeline_logs`, `state/`, `logs/`에
    기록합니다.
 
-기존 `data/speech_tracker/speeches.db`는 그대로 사용할 수 있습니다. 이미
-수집된 historical speech를 다시 전부 수집할 필요가 없습니다.
+기존 `data/speech_tracker/speeches.db`는 그대로 사용합니다. 이미 수집된
+historical speech를 다시 전부 수집할 필요가 없습니다.
+
+### SQLite backup
+
+기존 DB가 있으면 일일 pipeline이 데이터 변경 전에 SQLite backup API로
+consistent snapshot을 생성합니다.
+
+```text
+data/speech_tracker/backups/speeches_YYYY-MM-DD.db
+```
+
+같은 UTC 날짜에 이미 backup이 있으면 다시 만들지 않습니다. backup 파일은
+Git에 포함하지 않습니다.
 
 ## 분석 결과
 
@@ -43,10 +57,46 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 - `stance_reason`: 점수 판단 근거
 - `keywords`: 주요 경제 개념
 - `main_risk`: 가장 중요한 정책 리스크
-- `analysis_status`: `scored`, `no_signal`, `skipped`, `pending`
+- `analysis_status`: `scored`, `no_signal`, `skipped`, `pending`, `failed`
+- `model_name`: 분석에 사용한 Gemini model
+- `analysis_version`: 분석 방법론 버전
+
+현재 분석 방법론 버전은 `hawk_dove_v1`입니다.
 
 `no_signal`은 통화정책 방향 신호가 거의 없는 연설이고, `skipped`는 본문이
-없거나 너무 짧아 분석하지 않은 항목입니다.
+없거나 너무 짧아 분석하지 않은 항목입니다. Gemini 분석이 3회 실패하면
+`failed`로 종료합니다. `failed`는 더 이상 매일 pending queue를 막지 않습니다.
+
+기존 DB에서 `pending` 상태로 3회 이상 실패한 행도 DB 초기화 시 `failed`로
+정리됩니다.
+
+## Member status
+
+`last_speech_date`는 발언 활동도이지 재직 여부가 아닙니다. 따라서 365일 동안
+speech가 없다는 이유로 member를 자동 `retired` 처리하지 않습니다.
+
+`active` / `retired` 상태는 공식 roster 또는 실제 임기 정보처럼 재직 상태를
+확인할 수 있는 근거가 있을 때만 갱신합니다.
+
+## 데이터 변경 추적
+
+`speeches.updated_at`은 speech row가 마지막으로 변경된 UTC 시각입니다.
+기존 DB에는 컬럼을 additive migration으로 추가하고 기존 행은 `fetched_at` 또는
+`created_at` 값으로 채웁니다.
+
+향후 Snowflake 증분 적재에서는 다음 변경시각을 사용할 수 있습니다.
+
+- speeches: `updated_at`
+- members: `last_updated`
+- analysis_results: `analyzed_at`
+
+기존 PostgreSQL 시절의 `synced_at` 컬럼이 로컬 DB에 남아 있을 수 있지만
+물리적으로 삭제하지 않습니다. 기존 DB 보호를 위해 그대로 두고 현재 코드에서는
+읽거나 쓰지 않습니다. 새 DB schema에는 `synced_at`을 만들지 않습니다.
+
+DB와 `state/`에 새로 기록하는 operational timestamp는 UTC를 사용합니다.
+사람이 보는 `logs/app_YYYY-MM-DD.log`는 기존 log viewer와 운영 스케줄을 위해
+미국 동부시간을 유지합니다.
 
 ## Sentiment 파생 로직
 
@@ -71,6 +121,9 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 - `keywords`
 - `main_risk`
 - `analysis_status`
+- `model_name`
+- `analysis_version`
+- `speech_updated_at`
 - `collection_lag_days`
 - `analysis_lag_days`
 
@@ -105,10 +158,6 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 최초 이전 때는 기존 SQLite 데이터를 Snowflake RAW에 full load하고, 이후에는
 신규 또는 변경 데이터만 적재하는 방식으로 전환할 수 있습니다. Snowflake
 적재 코드는 현재 repository에 아직 추가하지 않습니다.
-
-기존 SQLite에 PostgreSQL 시절의 `synced_at` 컬럼이 남아 있을 수 있습니다.
-기존 DB 보호를 위해 컬럼을 강제로 삭제하지 않으며, 현재 파이프라인에서는
-외부 동기화 용도로 사용하지 않습니다.
 
 ## 설치
 
@@ -191,8 +240,6 @@ python scripts/speech_tracker/report_pipeline.py --limit 5
 
 운영 cron은 미국 동부시간 20:00에 하루 한 번 실행합니다.
 
-기존 한국 소재 macOS host에서 사용하던 cron 예시는 다음과 같습니다.
-
 ```cron
 0 9,10 * * * cd /Users/kimberlywexler/work/cb-speeches && /Users/kimberlywexler/work/cb-speeches/.venv/bin/python3 /Users/kimberlywexler/work/cb-speeches/scripts/speech_tracker/run_daily_eastern.py >> /Users/kimberlywexler/work/cb-speeches/logs/cron.daily-eastern.log 2>&1
 ```
@@ -221,4 +268,4 @@ python tools/speech_tracker/collector.py --stats
 ```
 
 Gemini free-tier quota에 걸리면 `429 RESOURCE_EXHAUSTED`가 발생할 수 있습니다.
-분석 가능한 `pending` speech가 남으면 통합 runner는 성공으로 종료하지 않습니다.
+일시 실패는 최대 3회까지 재시도되고, 이후 `failed` 상태로 종결됩니다.
