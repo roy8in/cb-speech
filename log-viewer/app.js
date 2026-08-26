@@ -3,7 +3,6 @@ const PIPELINE_COLUMNS = [
   { id: "collect", label: "Collect" },
   { id: "maintenance", label: "Maintenance" },
   { id: "analyze", label: "Analyze" },
-  { id: "sync", label: "Sync" },
   { id: "finish", label: "Finish" },
 ];
 
@@ -19,11 +18,7 @@ const JOB_SPECS = [
   { key: "member_cleanup", column: "maintenance", label: "Member cleanup" },
   { key: "initial_analysis", column: "analyze", label: "Initial analysis" },
   { key: "exhaustive_analysis", column: "analyze", label: "Exhaustive analysis" },
-  { key: "collection_sync", column: "sync", label: "Collection sync" },
-  { key: "postgres_sync", column: "sync", label: "PostgreSQL sync" },
 ];
-
-const SUCCESS_TONES = ["#0b7f44", "#15965a", "#2e7d32", "#23815f", "#4d8f3a", "#007a68"];
 
 const els = {
   date: document.querySelector("#logDate"),
@@ -57,40 +52,39 @@ function todayIso() {
   return new Date(now.getTime() - tzOffset).toISOString().slice(0, 10);
 }
 
+function parseExtra(extraText) {
+  const result = {};
+  if (!extraText) {
+    return result;
+  }
+  for (const part of extraText.split(", ")) {
+    const index = part.indexOf("=");
+    if (index > 0) {
+      result[part.slice(0, index).trim()] = part.slice(index + 1).trim();
+    }
+  }
+  return result;
+}
+
 function parseLine(line) {
   const parts = line.split(" | ");
   if (parts.length < 4) {
     return null;
   }
-
   const [timestamp, level, logger, ...messageParts] = parts;
   const rawMessage = messageParts.join(" | ");
-  const [message, extraText = ""] = rawMessage.split(" | ", 2);
+  const divider = rawMessage.indexOf(" | ");
+  const message = divider >= 0 ? rawMessage.slice(0, divider) : rawMessage;
+  const extraText = divider >= 0 ? rawMessage.slice(divider + 3) : "";
   return {
     timestamp,
     level: level.trim(),
     logger: logger.trim(),
     message: message.trim(),
     extraText: extraText.trim(),
-    raw: line,
     extra: parseExtra(extraText),
+    raw: line,
   };
-}
-
-function parseExtra(extraText) {
-  const result = {};
-  if (!extraText) {
-    return result;
-  }
-
-  for (const part of extraText.split(", ")) {
-    const index = part.indexOf("=");
-    if (index <= 0) {
-      continue;
-    }
-    result[part.slice(0, index).trim()] = part.slice(index + 1).trim();
-  }
-  return result;
 }
 
 function parseLog(text) {
@@ -102,16 +96,25 @@ function parseLog(text) {
     .filter(Boolean);
 }
 
-function selectLatestRun(events) {
-  const startIndex = events.map((event, index) => ({ event, index }))
-    .reverse()
-    .find((item) => item.event.message === "Starting sync run")?.index;
+function isRunStart(event) {
+  return ["Starting pipeline run", "Starting sync run"].includes(event.message);
+}
 
+function isRunFinish(event) {
+  return ["Finished pipeline run", "Finished sync run"].includes(event.message);
+}
+
+function selectLatestRun(events) {
+  const startIndex = events
+    .map((event, index) => ({ event, index }))
+    .reverse()
+    .find((item) => isRunStart(item.event))?.index;
   if (startIndex === undefined) {
     return events;
   }
-
-  const endOffset = events.slice(startIndex).findIndex((event) => event.message === "Finished sync run");
+  const endOffset = events
+    .slice(startIndex)
+    .findIndex((event) => isRunFinish(event));
   if (endOffset < 0) {
     return events.slice(startIndex);
   }
@@ -160,45 +163,6 @@ function fmtNumber(value) {
   return Number.isFinite(parsed) ? parsed.toLocaleString() : "-";
 }
 
-function findFirst(events, tokens) {
-  return events.find((event) => tokens.some((token) => event.message.includes(token) || event.extraText.includes(token)));
-}
-
-function findLast(events, tokens) {
-  return [...events].reverse().find((event) => tokens.some((token) => event.message.includes(token) || event.extraText.includes(token)));
-}
-
-function eventsBetween(events, start, end) {
-  if (!start && !end) {
-    return [];
-  }
-  const startMs = parseTimestamp(start?.timestamp) ?? -Infinity;
-  const endMs = parseTimestamp(end?.timestamp) ?? Infinity;
-  return events.filter((event) => {
-    const eventMs = parseTimestamp(event.timestamp);
-    return eventMs !== null && eventMs >= startMs && eventMs <= endMs;
-  });
-}
-
-function makeJob({ key, column, label, start, end, detail = "", status, duration, events = [] }) {
-  const jobEvents = events.length ? events : eventsBetween(currentEvents, start, end);
-  const hasError = jobEvents.some((event) => ["ERROR", "EXCEPTION"].includes(event.level));
-  const hasWarning = jobEvents.some((event) => event.level === "WARNING");
-  const inferredStatus = status ?? (!start && !end ? "unknown" : hasError ? "failed" : hasWarning ? "warning" : end ? "success" : "running");
-  return {
-    key,
-    column,
-    label,
-    startTime: start?.timestamp ?? end?.timestamp ?? "",
-    endTime: end?.timestamp ?? start?.timestamp ?? "",
-    duration: Number.isFinite(Number(duration)) ? Number(duration) : (start && end ? secondsBetween(start.timestamp, end.timestamp) : 0),
-    status: normalizeStatus(inferredStatus),
-    detail,
-    events: jobEvents,
-    issues: jobEvents.filter((event) => ["WARNING", "ERROR", "EXCEPTION"].includes(event.level)),
-  };
-}
-
 function normalizeStatus(status) {
   const value = String(status || "unknown").toLowerCase();
   if (["success", "failed", "running", "skipped", "warning"].includes(value)) {
@@ -207,68 +171,43 @@ function normalizeStatus(status) {
   if (value === "partial") {
     return "warning";
   }
-  if (value === "fail" || value === "error") {
+  if (["fail", "error"].includes(value)) {
     return "failed";
   }
   return "unknown";
 }
 
-function buildPipelineJobs(events) {
-  const jobs = JOB_SPECS
-    .map((spec) => buildStructuredJob(events, spec))
-    .filter(Boolean);
-
-  const finish = findLast(events, ["Finished sync run", "Everything is up-to-date"]);
-  jobs.push(makeJob({
-    key: "finish",
-    column: "finish",
-    label: "Finish run",
-    start: finish,
-    end: finish,
-    status: finish?.extra.status || inferStatus(events),
-    duration: finish?.extra.duration_sec,
-    detail: finish ? [
-      `new ${fmtNumber(finish.extra.total_new)}`,
-      `refreshed ${fmtNumber(finish.extra.total_refreshed)}`,
-      `analyzed ${fmtNumber(finish.extra.analyzed_items)}`,
-      `synced ${fmtNumber(finish.extra.synced_items)}`,
-      finish.extra.tableau_mart_items ? `marts ${fmtNumber(finish.extra.tableau_mart_items)}` : "",
-    ].filter(Boolean).join(" - ") : "",
-    events: finish ? [finish] : [],
-  }));
-
-  return jobs;
-}
-
-function buildStructuredJob(events, spec) {
-  const jobEvents = events.filter((event) => (
-    event.message === "Pipeline job status" &&
-    event.extra.job_name === spec.key
-  ));
-  if (!jobEvents.length) {
-    return null;
-  }
-
-  const start = jobEvents.find((event) => event.extra.status === "running") ?? jobEvents[0];
-  const end = [...jobEvents].reverse().find((event) => event.extra.status !== "running") ?? null;
-  const statusEvent = end ?? start;
-  const scopedEvents = eventsBetween(events, start, end ?? start);
-  const detail = buildJobDetail(spec.key, statusEvent, events);
-
-  return makeJob({
-    key: spec.key,
-    column: spec.column,
-    label: spec.label,
-    start,
-    end: end ?? start,
-    status: statusEvent?.extra.status,
-    duration: statusEvent?.extra.duration_sec,
-    detail,
-    events: scopedEvents.length ? scopedEvents : jobEvents,
+function eventsBetween(events, start, end) {
+  const startMs = parseTimestamp(start?.timestamp) ?? -Infinity;
+  const endMs = parseTimestamp(end?.timestamp) ?? Infinity;
+  return events.filter((event) => {
+    const eventMs = parseTimestamp(event.timestamp);
+    return eventMs !== null && eventMs >= startMs && eventMs <= endMs;
   });
 }
 
-function buildJobDetail(key, event, events) {
+function makeJob(spec, start, end, statusEvent, events) {
+  const scopedEvents = eventsBetween(events, start, end ?? start);
+  const issues = scopedEvents.filter((event) =>
+    ["WARNING", "ERROR", "EXCEPTION"].includes(event.level)
+  );
+  const duration = Number(statusEvent?.extra.duration_sec);
+  return {
+    key: spec.key,
+    column: spec.column,
+    label: spec.label,
+    startTime: start?.timestamp ?? "",
+    endTime: end?.timestamp ?? start?.timestamp ?? "",
+    duration: Number.isFinite(duration)
+      ? duration
+      : secondsBetween(start?.timestamp, end?.timestamp),
+    status: normalizeStatus(statusEvent?.extra.status),
+    detail: buildJobDetail(spec.key, statusEvent),
+    issues,
+  };
+}
+
+function buildJobDetail(key, event) {
   if (!event) {
     return "";
   }
@@ -280,160 +219,118 @@ function buildJobDetail(key, event, events) {
     ].filter(Boolean).join(" - ");
   }
   if (key === "collection") {
-    return `new ${fmtNumber(event.extra.total_new)} - refreshed ${fmtNumber(event.extra.total_refreshed)}`;
-  }
-  if (key.includes("analysis")) {
-    return `analyzed ${fmtNumber(event.extra.analyzed_items)}`;
-  }
-  if (key.includes("sync")) {
-    return [
-      `synced ${fmtNumber(event.extra.synced_items)}`,
-      `source ${fmtNumber(event.extra.source_synced_items)}`,
-      `marts ${fmtNumber(event.extra.tableau_mart_items)}`,
-      event.extra.mart_events_rows ? `events ${fmtNumber(event.extra.mart_events_rows)}` : "",
-      event.extra.mart_daily_rows ? `daily ${fmtNumber(event.extra.mart_daily_rows)}` : "",
-      event.extra.mart_plot_rows ? `plot ${fmtNumber(event.extra.mart_plot_rows)}` : "",
-    ].filter(Boolean).join(" - ");
-  }
-  if (key === "finish") {
     return [
       `new ${fmtNumber(event.extra.total_new)}`,
-      `analyzed ${fmtNumber(event.extra.analyzed_items)}`,
-      `synced ${fmtNumber(event.extra.synced_items)}`,
-      event.extra.tableau_mart_items ? `marts ${fmtNumber(event.extra.tableau_mart_items)}` : "",
+      `refreshed ${fmtNumber(event.extra.total_refreshed)}`,
+      event.extra.error_message ? `error ${event.extra.error_message}` : "",
     ].filter(Boolean).join(" - ");
   }
-  if (event.extra.reason) {
-    return event.extra.reason;
+  if (key.includes("analysis")) {
+    return [
+      `analyzed ${fmtNumber(event.extra.analyzed_items)}`,
+      event.extra.error_message ? `error ${event.extra.error_message}` : "",
+    ].filter(Boolean).join(" - ");
   }
   if (event.extra.error_message) {
-    return event.extra.error_message;
+    return `error ${event.extra.error_message}`;
   }
   return "";
 }
 
+function buildPipelineJobs(events) {
+  const jobs = JOB_SPECS.map((spec) => {
+    const jobEvents = events.filter((event) =>
+      event.message === "Pipeline job status"
+      && event.extra.job_name === spec.key
+    );
+    if (!jobEvents.length) {
+      return null;
+    }
+    const start = jobEvents.find((event) => event.extra.status === "running")
+      ?? jobEvents[0];
+    const end = [...jobEvents]
+      .reverse()
+      .find((event) => event.extra.status !== "running") ?? start;
+    return makeJob(spec, start, end, end, events);
+  }).filter(Boolean);
+
+  const finish = [...events].reverse().find(isRunFinish);
+  if (finish) {
+    jobs.push({
+      key: "finish",
+      column: "finish",
+      label: "Finish run",
+      startTime: finish.timestamp,
+      endTime: finish.timestamp,
+      duration: Number(finish.extra.duration_sec) || 0,
+      status: normalizeStatus(finish.extra.status),
+      detail: [
+        `new ${fmtNumber(finish.extra.total_new)}`,
+        `refreshed ${fmtNumber(finish.extra.total_refreshed)}`,
+        `analyzed ${fmtNumber(finish.extra.analyzed_items)}`,
+      ].join(" - "),
+      issues: [],
+    });
+  }
+  return jobs;
+}
+
 function inferStatus(events) {
+  const finish = [...events].reverse().find(isRunFinish);
+  if (finish?.extra.status) {
+    return finish.extra.status;
+  }
   if (events.some((event) => ["ERROR", "EXCEPTION"].includes(event.level))) {
     return "failed";
-  }
-  if (events.some((event) => event.message === "Finished sync run")) {
-    return "success";
   }
   return "unknown";
 }
 
-function getRunSummary(events) {
-  const start = events.find((event) => event.message === "Starting sync run");
-  const finish = [...events].reverse().find((event) => event.message === "Finished sync run");
-  return {
-    status: finish?.extra.status ?? inferStatus(events).toUpperCase(),
-    runId: finish?.extra.run_id ?? start?.extra.run_id ?? "-",
-    started: timeOnly(start?.timestamp ?? events[0]?.timestamp),
-    ended: timeOnly(finish?.timestamp ?? events.at(-1)?.timestamp),
-    duration: finish?.extra.duration_sec ? fmtSeconds(Number(finish.extra.duration_sec)) : fmtSeconds(secondsBetween(events[0]?.timestamp, events.at(-1)?.timestamp)),
-    totalNew: fmtNumber(finish?.extra.total_new),
-    totalRefreshed: fmtNumber(finish?.extra.total_refreshed),
-    analyzedItems: fmtNumber(finish?.extra.analyzed_items),
-    syncedItems: fmtNumber(finish?.extra.synced_items),
-    sourceSyncedItems: fmtNumber(finish?.extra.source_synced_items),
-    tableauMartItems: fmtNumber(finish?.extra.tableau_mart_items),
-    failedSteps: finish?.extra.failed_steps || "-",
-  };
-}
-
 function renderSummary(events) {
-  const summary = getRunSummary(events);
-  const statusClass = normalizeStatus(summary.status);
-  els.status.className = `status-pill ${statusClass}`;
-  els.status.textContent = summary.status;
-  els.runId.textContent = summary.runId;
-  els.started.textContent = summary.started;
-  els.ended.textContent = summary.ended;
-  els.duration.textContent = summary.duration;
+  const start = events.find(isRunStart);
+  const finish = [...events].reverse().find(isRunFinish);
+  const status = inferStatus(events).toUpperCase();
+  els.status.className = `status-pill ${normalizeStatus(status)}`;
+  els.status.textContent = status;
+  els.runId.textContent = finish?.extra.run_id ?? start?.extra.run_id ?? "-";
+  els.started.textContent = timeOnly(start?.timestamp ?? events[0]?.timestamp);
+  els.ended.textContent = timeOnly(finish?.timestamp ?? events.at(-1)?.timestamp);
+  els.duration.textContent = finish?.extra.duration_sec
+    ? fmtSeconds(finish.extra.duration_sec)
+    : fmtSeconds(secondsBetween(events[0]?.timestamp, events.at(-1)?.timestamp));
   els.rows.innerHTML = `
     <div class="count-grid">
-      <div class="count-item"><span>New</span><strong>${summary.totalNew}</strong></div>
-      <div class="count-item"><span>Refreshed</span><strong>${summary.totalRefreshed}</strong></div>
-      <div class="count-item"><span>Analyzed</span><strong>${summary.analyzedItems}</strong></div>
-      <div class="count-item"><span>Synced</span><strong>${summary.syncedItems}</strong></div>
-      <div class="count-item"><span>Source Sync</span><strong>${summary.sourceSyncedItems}</strong></div>
-      <div class="count-item"><span>Mart Rows</span><strong>${summary.tableauMartItems}</strong></div>
-      <div class="count-item"><span>Failures</span><strong>${escapeHtml(summary.failedSteps)}</strong></div>
+      <div class="count-item"><span>New</span><strong>${fmtNumber(finish?.extra.total_new)}</strong></div>
+      <div class="count-item"><span>Refreshed</span><strong>${fmtNumber(finish?.extra.total_refreshed)}</strong></div>
+      <div class="count-item"><span>Analyzed</span><strong>${fmtNumber(finish?.extra.analyzed_items)}</strong></div>
+      <div class="count-item"><span>Failures</span><strong>${escapeHtml(finish?.extra.failed_steps || "-")}</strong></div>
     </div>
   `;
   els.eventCount.textContent = `${events.length.toLocaleString()} events`;
 }
 
 function renderDurationBars(jobs) {
-  const visibleJobs = jobs.filter((job) => (
-    job.key !== "finish" &&
-    job.status !== "skipped" &&
-    job.duration > 0.05 &&
-    (job.startTime || job.endTime)
-  ));
-  if (!visibleJobs.length) {
-    els.durationBars.innerHTML = `<div class="duration-empty">No timed jobs</div>`;
+  const visible = jobs.filter((job) =>
+    job.key !== "finish"
+    && job.status !== "skipped"
+    && job.duration > 0.05
+  );
+  if (!visible.length) {
+    els.durationBars.innerHTML = '<div class="duration-empty">No timed jobs</div>';
     return;
   }
-
-  const totalDuration = visibleJobs.reduce((sum, job) => sum + job.duration, 0) || 1;
-  const segments = visibleJobs.map((job, index) => {
-    const width = Math.max(0.7, (job.duration / totalDuration) * 100);
-    const title = `${job.label}: ${fmtSeconds(job.duration)} (${job.status})`;
-    const segmentColor = job.status === "success" ? SUCCESS_TONES[index % SUCCESS_TONES.length] : "";
-    const colorStyle = segmentColor ? `; --segment-color: ${segmentColor}` : "";
+  const total = visible.reduce((sum, job) => sum + job.duration, 0) || 1;
+  const segments = visible.map((job) => {
+    const width = Math.max(0.7, (job.duration / total) * 100);
     return `
-      <div
-        class="duration-segment ${escapeHtml(job.status)}"
-        style="flex-basis: ${width}%${colorStyle}"
-        title="${escapeHtml(title)}"
-        aria-label="${escapeHtml(title)}"
-      >
+      <div class="duration-segment ${escapeHtml(job.status)}"
+           style="flex-basis: ${width}%"
+           title="${escapeHtml(job.label)}: ${fmtSeconds(job.duration)}">
         <span>${escapeHtml(job.label)}</span>
       </div>
     `;
   }).join("");
-
-  const legend = visibleJobs.map((job, index) => {
-    const segmentColor = job.status === "success" ? SUCCESS_TONES[index % SUCCESS_TONES.length] : "";
-    const colorStyle = segmentColor ? ` style="--segment-color: ${segmentColor}"` : "";
-    return `
-    <div class="duration-legend-item" title="${escapeHtml(job.label)}">
-      <span class="legend-dot ${escapeHtml(job.status)}"${colorStyle}></span>
-      <span class="legend-label">${escapeHtml(job.label)}</span>
-      <strong>${fmtSeconds(job.duration)}</strong>
-    </div>
-  `;
-  }).join("");
-
-  els.durationBars.innerHTML = `
-    <div class="duration-timeline">${segments}</div>
-    <div class="duration-legend">${legend}</div>
-  `;
-}
-
-function renderPipeline(jobs) {
-  els.pipeline.innerHTML = PIPELINE_COLUMNS.map((column) => {
-    const columnJobs = jobs.filter((job) => job.column === column.id);
-    return `
-      <section class="pipeline-column">
-        <div class="column-title">
-          <strong>${escapeHtml(column.label)}</strong>
-          <span>${columnJobs.length}</span>
-        </div>
-        <div class="job-list">
-          ${columnJobs.map(renderJob).join("") || `<div class="job unknown"><div class="job-name">No jobs</div></div>`}
-        </div>
-      </section>
-    `;
-  }).join("");
-
-  document.querySelectorAll("[data-job-issues]").forEach((button) => {
-    button.addEventListener("click", () => {
-      issueScope = button.dataset.jobIssues;
-      openIssues();
-    });
-  });
+  els.durationBars.innerHTML = `<div class="duration-timeline">${segments}</div>`;
 }
 
 function renderJob(job) {
@@ -453,24 +350,47 @@ function renderJob(job) {
   `;
 }
 
+function renderPipeline(jobs) {
+  els.pipeline.innerHTML = PIPELINE_COLUMNS.map((column) => {
+    const columnJobs = jobs.filter((job) => job.column === column.id);
+    const body = columnJobs.length
+      ? columnJobs.map(renderJob).join("")
+      : '<div class="job unknown"><div class="job-name">No jobs</div></div>';
+    return `
+      <section class="pipeline-column">
+        <div class="column-title">
+          <strong>${escapeHtml(column.label)}</strong>
+          <span>${columnJobs.length}</span>
+        </div>
+        <div class="job-list">${body}</div>
+      </section>
+    `;
+  }).join("");
+
+  document.querySelectorAll("[data-job-issues]").forEach((button) => {
+    button.addEventListener("click", () => {
+      issueScope = button.dataset.jobIssues;
+      openIssues();
+    });
+  });
+}
+
 function renderIssues() {
   const source = issueScope
     ? currentJobs.find((job) => job.key === issueScope)?.issues ?? []
-    : currentEvents.filter((event) => ["WARNING", "ERROR", "EXCEPTION"].includes(event.level));
-
-  const title = issueScope
-    ? `${currentJobs.find((job) => job.key === issueScope)?.label ?? issueScope}: ${source.length} issue(s)`
-    : `${source.length} issue(s)`;
-  els.issueCount.textContent = title;
+    : currentEvents.filter((event) =>
+        ["WARNING", "ERROR", "EXCEPTION"].includes(event.level)
+      );
+  els.issueCount.textContent = `${source.length} issue(s)`;
   els.issues.innerHTML = source.length
     ? source.slice().reverse().map((event) => `
-      <div class="issue">
-        <strong class="level-${event.level}">${event.level} - ${escapeHtml(event.message)}</strong>
-        <time>${timeOnly(event.timestamp)} - ${escapeHtml(event.logger)}</time>
-        ${event.extraText ? `<p>${escapeHtml(event.extraText)}</p>` : ""}
-      </div>
-    `).join("")
-    : `<div class="issue"><strong>No warnings or errors</strong><time>No issue events in this scope.</time></div>`;
+        <div class="issue">
+          <strong class="level-${event.level}">${escapeHtml(event.level)} - ${escapeHtml(event.message)}</strong>
+          <time>${timeOnly(event.timestamp)} - ${escapeHtml(event.logger)}</time>
+          ${event.extraText ? `<p>${escapeHtml(event.extraText)}</p>` : ""}
+        </div>
+      `).join("")
+    : '<div class="issue"><strong>No warnings or errors</strong></div>';
 }
 
 function openIssues() {
@@ -493,7 +413,6 @@ function renderRows() {
     const textOk = !keyword || event.raw.toLowerCase().includes(keyword);
     return levelOk && textOk;
   });
-
   els.eventRows.innerHTML = filtered.map((event) => `
     <tr>
       <td>${timeOnly(event.timestamp)}</td>
@@ -531,25 +450,21 @@ async function loadDate(dateValue) {
   if (!dateValue) {
     return;
   }
-
   showNotice("");
   const url = `../logs/app_${dateValue}.log?ts=${Date.now()}`;
   try {
     const response = await fetch(url);
     if (!response.ok) {
       clearView();
-      showNotice(`Cannot read logs/app_${dateValue}.log. Run the local server from the repository root.`);
+      showNotice(`Cannot read logs/app_${dateValue}.log.`);
       return;
     }
-
-    const text = await response.text();
-    currentEvents = selectLatestRun(parseLog(text));
+    currentEvents = selectLatestRun(parseLog(await response.text()));
     if (!currentEvents.length) {
       clearView();
-      showNotice("The log file was opened, but no parseable events were found.");
+      showNotice("No parseable events were found.");
       return;
     }
-
     currentJobs = buildPipelineJobs(currentEvents);
     renderSummary(currentEvents);
     renderDurationBars(currentJobs);
