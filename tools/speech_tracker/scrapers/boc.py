@@ -1,35 +1,42 @@
-"""Bank of Canada speech scraper."""
+"""
+Bank of Canada (BOC) Speech Scraper
 
-import logging
+Source: https://www.bankofcanada.ca/press/speeches/
+List page uses pagination via ?mt_page=N
+Speech URLs: /YYYY/MM/slug/
+Multimedia (webcasts) URLs: /multimedia/slug/ (excluded)
+"""
+
 import re
+import logging
 from datetime import datetime, timezone
-
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
 
 
 class BOCScraper(BaseScraper):
-    """Collect text-based speeches and appearances from the Bank of Canada."""
-
-    BANK_CODE = "BOC"
-    BANK_NAME = "Bank of Canada"
-    BASE_URL = "https://www.bankofcanada.ca"
-    SPEECHES_URL = f"{BASE_URL}/press/speeches/"
+    BANK_CODE = 'BOC'
+    BANK_NAME = 'Bank of Canada'
+    BASE_URL = 'https://www.bankofcanada.ca'
+    SPEECHES_URL = f'{BASE_URL}/press/speeches/'
     ALLOWED_CONTENT_TYPES = {
-        "Comments",
-        "Lectures",
-        "Opening statements",
-        "Presentations",
-        "Remarks",
-        "Speech summaries",
+        'Comments',
+        'Lectures',
+        'Opening statements',
+        'Presentations',
+        'Remarks',
+        'Speech summaries',
     }
 
     def fetch_speech_list(self, year=None):
-        """Fetch the BOC speech list, following pagination."""
+        """
+        Fetch list of BOC speeches with pagination support.
+        If year is given, filter results to that year.
+        """
         all_speeches = []
         page = 1
-        max_pages = 300
+        max_pages = 300  # Increased limit to allow fetching back to 2008
 
         while page <= max_pages:
             url = self.SPEECHES_URL
@@ -38,189 +45,192 @@ class BOCScraper(BaseScraper):
 
             resp = self._get(url)
             if not resp:
-                raise RuntimeError(
-                    f"Failed to fetch BOC speeches page {page}: {url}"
-                )
-
-            soup = self._parse_html(resp.text)
-            speeches_on_page = self._parse_speech_list_page(soup)
-            if not speeches_on_page:
                 if page == 1:
                     raise RuntimeError(
-                        "BOC speeches page returned no parseable results"
+                        f"Failed to fetch BOC speeches page: {url}"
                     )
                 break
 
+            soup = self._parse_html(resp.text)
+            speeches_on_page = self._parse_speech_list_page(soup)
+
+            if not speeches_on_page:
+                break  # no more results
+
             all_speeches.extend(speeches_on_page)
-            if not self._has_next_page(soup):
-                break
             page += 1
 
+            # Check if there's a next page
+            if not self._has_next_page(soup):
+                break
+
+        # Filter by year if specified
         if year:
             year_str = str(year)
-            all_speeches = [
-                speech
-                for speech in all_speeches
-                if speech["date"].startswith(year_str)
-            ]
+            all_speeches = [s for s in all_speeches if s['date'].startswith(year_str)]
 
-        unique = {speech["url"]: speech for speech in all_speeches}
-        logger.info(
-            "[%s] Found %s speeches",
-            self.BANK_CODE,
-            len(unique),
-        )
+        # Deduplicate by URL
+        unique = {s['url']: s for s in all_speeches}
+        logger.info(f"[{self.BANK_CODE}] Found {len(unique)} speeches")
         return list(unique.values())
 
     def _parse_speech_list_page(self, soup):
-        """Parse one BOC result page."""
+        """Parse a single page of the speech list."""
         speeches = []
-        root = soup.find("main") or soup
 
-        containers = root.find_all(
-            ["div", "article"],
-            class_=["media", "mtt-result"],
-        )
-        for container in containers:
-            heading = container.find(["h3", "h5"])
-            if not heading:
+        # Restrict parsing to the page's main content. The full BOC HTML also
+        # contains menu/news teaser blocks with the same "media" class.
+        root = soup.find('main') or soup
+
+        # Each speech entry is typically inside a .media result container.
+        # The date is in a span with class 'media-date'.
+        for container in root.find_all(['div', 'article'], class_=['media', 'mtt-result']):
+            h3 = container.find(['h3', 'h5'])
+            if not h3:
                 continue
 
-            link = heading.find("a", href=True)
+            link = h3.find('a', href=True)
             if not link:
                 continue
 
-            href = link["href"]
+            href = link['href']
             title = link.get_text(strip=True)
+
             if not title or len(title) < 10:
                 continue
-            if "/multimedia/" in href:
+
+            # Skip multimedia/webcast links - only collect text speeches
+            if '/multimedia/' in href:
                 continue
 
             content_types = self._extract_content_types(container)
             if not self._is_collectable_content_type(content_types):
                 continue
-            if not re.search(r"/\d{4}/\d{2}/", href):
+
+            # Only collect links matching /YYYY/MM/ pattern (actual speech pages)
+            if not re.search(r'/\d{4}/\d{2}/', href):
                 continue
 
-            if href.startswith("/"):
+            # Build absolute URL
+            if href.startswith('/'):
                 speech_url = f"{self.BASE_URL}{href}"
-            elif href.startswith("http"):
+            elif href.startswith('http'):
                 speech_url = href
             else:
                 continue
 
-            date = ""
-            date_tag = container.find(
-                "span",
-                class_=["media-date", "pressdate"],
-            )
+            # 1. Extract date from text (e.g., "March 4, 2026")
+            date = ''
+            date_tag = container.find('span', class_=['media-date', 'pressdate'])
             if date_tag:
-                date = self._parse_boc_date(
-                    date_tag.get_text(strip=True)
-                )
+                date_text = date_tag.get_text(strip=True)
+                date = self._parse_boc_date(date_text)
 
+            # 2. Fallback to URL date if text date extraction failed
             if not date:
-                date_match = re.search(r"/(\d{4})/(\d{2})/", href)
+                date_match = re.search(r'/(\d{4})/(\d{2})/', href)
                 if date_match:
-                    date = (
-                        f"{date_match.group(1)}-"
-                        f"{date_match.group(2)}-01"
-                    )
+                    date = f"{date_match.group(1)}-{date_match.group(2)}-01"
 
-            speaker = self._extract_speaker(heading)
+            # 3. Extract speaker from nearby /profile/ link
+            speaker = self._extract_speaker(h3)
+            
+            # 4. Fallback: Extract from title if speaker is still None
             if not speaker:
-                for separator in (":", "—", " - "):
-                    if separator not in title:
-                        continue
-                    potential = title.split(separator, 1)[0].strip()
-                    if 1 < len(potential.split()) < 5:
-                        speaker = potential
-                        break
+                for sep in [':', '—', ' - ']:
+                    if sep in title:
+                        potential = title.split(sep)[0].strip()
+                        if 1 < len(potential.split()) < 5:
+                            speaker = potential
+                            break
 
-            speeches.append(
-                {
-                    "title": title,
-                    "date": date,
-                    "url": speech_url,
-                    "speaker": speaker,
-                    "speech_type": self._primary_speech_type(
-                        content_types
-                    ),
-                }
-            )
+            speeches.append({
+                'title': title,
+                'date': date,
+                'url': speech_url,
+                'speaker': speaker,
+                'speech_type': self._primary_speech_type(content_types),
+            })
 
         return speeches
 
     def _extract_content_types(self, container):
         """Return BOC content-type labels attached to a result card."""
         content_types = []
-        for link in container.find_all("a"):
+        for link in container.find_all('a'):
             label = link.get_text(" ", strip=True)
-            if (
-                label in self.ALLOWED_CONTENT_TYPES
-                or label == "Webcasts"
-            ):
+            if label in self.ALLOWED_CONTENT_TYPES or label == 'Webcasts':
                 content_types.append(label)
         return content_types
 
     def _is_collectable_content_type(self, content_types):
-        """Return True for text speech-like content, excluding webcasts."""
-        if not content_types or "Webcasts" in content_types:
+        """Collect textual speech-like BOC content, not webcasts/news items."""
+        if not content_types:
             return False
-        return any(
-            content_type in self.ALLOWED_CONTENT_TYPES
-            for content_type in content_types
-        )
+        if 'Webcasts' in content_types:
+            return False
+        return any(ct in self.ALLOWED_CONTENT_TYPES for ct in content_types)
 
     def _primary_speech_type(self, content_types):
         for content_type in content_types:
             if content_type in self.ALLOWED_CONTENT_TYPES:
                 return content_type
-        return "speech"
+        return 'speech'
 
-    @staticmethod
-    def _parse_boc_date(date_text):
-        """Parse common BOC publication-date formats."""
+    def _parse_boc_date(self, date_text):
+        """Parse BOC date formats like 'March 4, 2026' or 'March 04, 2026'."""
         if not date_text:
             return None
-
-        date_text = date_text.replace("\xa0", " ").strip()
-        for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+            
+        # Clean the text (remove extra spaces, non-breaking spaces)
+        date_text = date_text.replace('\xa0', ' ').strip()
+        
+        for fmt in ['%B %d, %Y', '%b %d, %Y', '%Y-%m-%d']:
             try:
-                return datetime.strptime(
-                    date_text,
-                    fmt,
-                ).strftime("%Y-%m-%d")
+                dt = datetime.strptime(date_text, fmt)
+                return dt.strftime('%Y-%m-%d')
             except ValueError:
                 continue
+                
+        # Try a more flexible regex for dates like "March 4, 2026"
+        match = re.search(r'([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})', date_text)
+        if match:
+            month_str, day_str, year_str = match.groups()
+            try:
+                # Use strptime with %B for full month name
+                dt = datetime.strptime(f"{month_str} {day_str} {year_str}", "%B %d %Y")
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+
         return None
 
-    @staticmethod
-    def _extract_speaker(heading):
-        """Extract the speaker from the result card's profile link."""
-        container = heading.find_parent(["div", "article"])
-        if not container:
+    def _extract_speaker(self, h3_tag):
+        """Extract speaker name from the /profile/ link near the h3 tag."""
+        # Look in the parent container for a profile link
+        parent = h3_tag.parent
+        if not parent:
             return None
 
-        profile_link = container.find(
-            "a",
-            href=re.compile(r"/profile/"),
-        )
-        if not profile_link:
-            return None
-        return profile_link.get_text(strip=True)
+        # Search up to 2 levels of parents/siblings
+        container = h3_tag.find_parent(['div', 'article'])
+        if container:
+            profile_link = container.find('a', href=re.compile(r'/profile/'))
+            if profile_link:
+                # Remove extra info like 'Governor - Executive' if needed
+                return profile_link.get_text(strip=True)
 
-    @staticmethod
-    def _has_next_page(soup):
-        """Return True when BOC pagination exposes another page."""
-        return bool(
-            soup.find("a", class_="next")
-            or soup.find("a", string=re.compile(r"Next|›|»"))
-        )
+        return None
+
+    def _has_next_page(self, soup):
+        """Check if there's a next page in pagination."""
+        pagination = soup.find('a', class_='next') or soup.find('a', string=re.compile(r'Next|›|»'))
+        if pagination:
+            return True
+        return False
 
     def fetch_speech_text(self, url):
-        """Fetch and clean one BOC speech page."""
+        """Fetch the full text of a BOC speech."""
         resp = self._get(url)
         if not resp:
             return None
@@ -230,55 +240,42 @@ class BOCScraper(BaseScraper):
 
         try:
             soup = self._parse_html(resp.text)
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to parse HTML for %s: %s",
-                self.BANK_CODE,
-                url,
-                exc,
-            )
+        except Exception as e:
+            logger.warning(f"[{self.BANK_CODE}] Failed to parse HTML for {url}: {e}")
             return None
 
-        content = (
-            soup.find("main")
-            or soup.find("article")
-            or soup.find("div", id="main-content")
-        )
-        if not content:
-            return None
+        # Try the most logical main containers
+        content = soup.find('main') or soup.find('article') or soup.find('div', id='main-content')
+        
+        if content:
+            # Aggressively remove known navigation and redundant sections
+            for tag in content.find_all(['nav', 'header', 'footer', 'script', 'style', 'aside', 'form']):
+                tag.decompose()
+            
+            # BOC specific: remove modules that are typically sidebar or navigation
+            for tag in content.find_all('div', class_=['related-info', 'media-sidebar', 'sharing-tools', 'cfct-sidebar']):
+                tag.decompose()
 
-        for tag in content.find_all(
-            ["nav", "header", "footer", "script", "style", "aside", "form"]
-        ):
-            tag.decompose()
+            text = content.get_text(separator='\n', strip=True)
+            text = self._clean_speech_text(text)
+            
+            # If the text starts with "About us" or "What we do", it's likely still grabbing the menu
+            # Let's try to find the first <h2> or <h3> which is usually the title/introduction
+            if "About us" in text[:200]:
+                real_start = content.find(['h1', 'h2', 'h3'])
+                if real_start:
+                    # Collect text only from the real start onwards
+                    all_text = []
+                    for sibling in real_start.find_all_next(string=True):
+                        all_text.append(sibling)
+                    text = '\n'.join(all_text).strip()
 
-        for tag in content.find_all(
-            "div",
-            class_=[
-                "related-info",
-                "media-sidebar",
-                "sharing-tools",
-                "cfct-sidebar",
-            ],
-        ):
-            tag.decompose()
+            return text
 
-        text = content.get_text(separator="\n", strip=True)
-        text = self._clean_speech_text(text)
-
-        if "About us" in text[:200]:
-            real_start = content.find(["h1", "h2", "h3"])
-            if real_start:
-                text = "\n".join(
-                    sibling.strip()
-                    for sibling in real_start.find_all_next(string=True)
-                    if sibling.strip()
-                )
-
-        return self._clean_speech_text(text)
+        return None
 
     def collect_recent(self, fetch_text=True):
-        """Collect current-year BOC speeches and refresh changed rows."""
+        """Collect current-year BOC speeches and refresh changed existing rows."""
         current_year = datetime.now().year
         existing_urls = self.db.get_existing_urls(self.BANK_CODE)
         existing_by_normalized_url = {
@@ -288,12 +285,11 @@ class BOCScraper(BaseScraper):
         speech_list = self.fetch_speech_list(year=current_year)
         if not speech_list:
             existing_count = self.db.count_speeches_for_year(
-                self.BANK_CODE,
-                current_year,
+                self.BANK_CODE, current_year
             )
             if existing_count > 0:
                 raise RuntimeError(
-                    "BOC scraper returned 0 speeches for "
+                    f"{self.BANK_CODE} scraper returned 0 speeches for "
                     f"{current_year}, but SQLite already contains "
                     f"{existing_count}."
                 )
@@ -302,8 +298,8 @@ class BOCScraper(BaseScraper):
         new_count = 0
         refreshed_count = 0
         for speech_info in speech_list:
-            normalized_url = self.normalize_url(speech_info["url"])
-            stored_url = existing_by_normalized_url.get(normalized_url)
+            url = self.normalize_url(speech_info['url'])
+            stored_url = existing_by_normalized_url.get(url)
             if stored_url:
                 if self._refresh_existing_speech(
                     speech_info,
@@ -313,29 +309,26 @@ class BOCScraper(BaseScraper):
                     refreshed_count += 1
                 continue
 
-            existing_by_normalized_url[normalized_url] = speech_info["url"]
+            existing_by_normalized_url[url] = speech_info['url']
+
             full_text = None
             if fetch_text:
-                full_text = self.fetch_speech_text(speech_info["url"])
+                full_text = self.fetch_speech_text(speech_info['url'])
 
             speech_id = self.db.insert_speech(
                 bank_code=self.BANK_CODE,
-                speaker=speech_info.get("speaker"),
-                title=speech_info["title"],
-                date=speech_info["date"],
-                url=speech_info["url"],
+                speaker=speech_info.get('speaker'),
+                title=speech_info['title'],
+                date=speech_info['date'],
+                url=speech_info['url'],
                 full_text=full_text,
-                speech_type=speech_info.get("speech_type", "speech"),
+                speech_type=speech_info.get('speech_type', 'speech'),
             )
             if speech_id:
                 new_count += 1
 
         if refreshed_count:
-            logger.info(
-                "[%s] Refreshed %s existing recent speeches",
-                self.BANK_CODE,
-                refreshed_count,
-            )
+            logger.info(f"[{self.BANK_CODE}] Refreshed {refreshed_count} existing recent speeches")
         return new_count
 
     def _refresh_existing_speech(
@@ -344,18 +337,12 @@ class BOCScraper(BaseScraper):
         stored_url,
         fetch_text=True,
     ):
-        """Refresh an existing BOC row when its source page changed."""
+        """Refresh metadata/text for an existing BOC URL when the page changed."""
         conn = self.db._get_conn()
         try:
             row = conn.execute(
                 """
-                SELECT
-                    s.id,
-                    s.title,
-                    s.date,
-                    s.speech_type,
-                    s.full_text,
-                    m.name AS speaker
+                SELECT s.id, s.title, s.date, s.speech_type, s.full_text, m.name AS speaker
                 FROM speeches s
                 LEFT JOIN members m ON s.speaker_id = m.id
                 WHERE s.url = ?
@@ -368,33 +355,38 @@ class BOCScraper(BaseScraper):
         if not row:
             return False
 
-        desired_type = speech_info.get("speech_type", "speech")
-        desired_speaker = speech_info.get("speaker")
-        dirty_text = self._looks_like_dirty_boc_text(row["full_text"])
+        desired_type = speech_info.get('speech_type', 'speech')
+        desired_speaker = speech_info.get('speaker')
+        dirty_text = self._looks_like_dirty_boc_text(row['full_text'])
         metadata_changed = (
-            row["title"] != speech_info["title"]
-            or row["date"] != speech_info["date"]
-            or row["speech_type"] != desired_type
-            or row["speaker"] != desired_speaker
+            row['title'] != speech_info['title']
+            or row['date'] != speech_info['date']
+            or row['speech_type'] != desired_type
+            or row['speaker'] != desired_speaker
         )
+
         if not metadata_changed and not dirty_text:
             return False
 
-        full_text = row["full_text"]
-        if fetch_text:
-            fetched_text = self.fetch_speech_text(speech_info["url"])
+        full_text = row['full_text']
+        fetched_text = None
+        if fetch_text and (dirty_text or metadata_changed):
+            fetched_text = self.fetch_speech_text(speech_info['url'])
             if fetched_text:
                 full_text = fetched_text
 
+        if dirty_text and not metadata_changed and not fetched_text:
+            return False
+
         content_changed = (
-            full_text != row["full_text"]
-            or speech_info["date"] != row["date"]
+            full_text != row['full_text']
+            or row['date'] != speech_info['date']
         )
         if content_changed:
             self.db.update_speech_content(
-                row["id"],
+                row['id'],
                 full_text,
-                speech_info["date"],
+                speech_info['date'],
             )
 
         speaker_id = self.db.get_or_create_member(
@@ -413,11 +405,11 @@ class BOCScraper(BaseScraper):
                 WHERE id = ?
                 """,
                 (
-                    speech_info["title"],
+                    speech_info['title'],
                     speaker_id,
                     desired_type,
                     datetime.now(timezone.utc).isoformat(),
-                    row["id"],
+                    row['id'],
                 ),
             )
             conn.commit()
@@ -426,64 +418,52 @@ class BOCScraper(BaseScraper):
 
         return True
 
-    @staticmethod
-    def _looks_like_dirty_boc_text(text):
+    def _looks_like_dirty_boc_text(self, text):
         if not text:
             return False
         return any(
             marker in text
-            for marker in (
-                "Share this page",
-                "Content Type(s)",
-                "Related Information",
-            )
+            for marker in ('Share this page', 'Content Type(s)', 'Related Information')
         )
 
-    @staticmethod
-    def _clean_speech_text(text):
-        """Remove BOC page chrome while retaining speech content."""
+    def _clean_speech_text(self, text):
+        """Remove BOC page chrome while keeping title, metadata, and remarks."""
         if not text:
             return text
 
         lines = []
         previous = None
-        for raw_line in text.replace("\xa0", " ").splitlines():
+        for raw_line in text.replace('\xa0', ' ').splitlines():
             line = raw_line.strip()
-            if not line or line == previous:
+            if not line:
                 continue
-            if line.startswith("Share this page"):
+            if line == previous:
                 continue
-            if line in {"Available as:", "PDF", "Audio", "Video"}:
+            if line.startswith('Share this page'):
+                continue
+            if line in {'Available as:', 'PDF', 'Audio', 'Video'}:
                 continue
             lines.append(line)
             previous = line
 
-        cut_markers = {
-            "Content Type(s)",
-            "Subject(s)",
-            "Related Information",
-        }
+        cut_markers = {'Content Type(s)', 'Subject(s)', 'Related Information'}
         for index, line in enumerate(lines):
             if line in cut_markers:
                 lines = lines[:index]
                 break
 
-        return "\n".join(lines).strip()
+        return '\n'.join(lines).strip()
 
     def get_all_speeches(self, start_year=None, end_year=None):
-        """Fetch the paginated BOC archive and filter by year range."""
+        """
+        BOC uses pagination, not year-based URLs.
+        Fetch all and filter by year range.
+        """
         all_speeches = self.fetch_speech_list()
 
         if start_year:
-            all_speeches = [
-                speech
-                for speech in all_speeches
-                if speech["date"] >= f"{start_year}-01-01"
-            ]
+            all_speeches = [s for s in all_speeches if s['date'] >= f"{start_year}-01-01"]
         if end_year:
-            all_speeches = [
-                speech
-                for speech in all_speeches
-                if speech["date"] <= f"{end_year}-12-31"
-            ]
+            all_speeches = [s for s in all_speeches if s['date'] <= f"{end_year}-12-31"]
+
         return all_speeches
