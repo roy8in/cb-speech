@@ -9,6 +9,33 @@
 PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 별도 단계로
 추가할 예정입니다.
 
+## 전체 구조
+
+현재 실행되는 로컬 파이프라인과 향후 Snowflake 구조를 함께 보면 다음과 같습니다.
+점선 구간은 아직 구현하지 않은 향후 단계입니다.
+
+```mermaid
+flowchart LR
+    Sources["FRB / ECB / BOE / BOJ / RBA / BOC<br/>official sources"]
+    Scrapers["Bank-specific scrapers<br/>tools/speech_tracker/scrapers/"]
+    SQLite[("SQLite<br/>speeches.db")]
+    Gemini["Gemini<br/>hawk/dove analysis"]
+    Sentiment["sentiment.py<br/>Python reference"]
+    Raw["Snowflake RAW"]
+    Core["Snowflake CORE"]
+    View["Snowflake VIEW"]
+
+    Sources --> Scrapers
+    Scrapers --> SQLite
+    SQLite --> Gemini
+    Gemini --> SQLite
+    SQLite --> Sentiment
+
+    SQLite -. future upload .-> Raw
+    Raw -. future SQL .-> Core
+    Core -. future views .-> View
+```
+
 ## 주요 경로
 
 - `data/speech_tracker/speeches.db`: 로컬 SQLite 데이터베이스
@@ -24,6 +51,28 @@ PostgreSQL과 Tableau 연결은 사용하지 않습니다. Snowflake 적재는 �
 - `log-viewer/`: 로컬 브라우저 pipeline log viewer
 
 ## 데이터 흐름
+
+일일 실행 흐름은 다음과 같습니다.
+
+```mermaid
+flowchart TD
+    A["run_daily_eastern.py"] --> B["sync_and_analyze.py"]
+    B --> C["Backup SQLite"]
+    C --> D["Collect recent speeches"]
+    D --> E{"New or changed speech?"}
+
+    E -->|New| F["Insert speech"]
+    E -->|Changed| G["Refresh speech"]
+    E -->|No change| H["Skip"]
+
+    G --> I["Reset prior analysis to pending"]
+    F --> J["Gemini analysis"]
+    I --> J
+
+    J --> K["Save analysis_results"]
+    K --> L["Write pipeline logs and state"]
+    H --> L
+```
 
 1. 일일 runner가 기존 SQLite DB의 snapshot을 먼저 만듭니다.
 2. 중앙은행 홈페이지에서 연설 목록과 본문을 수집합니다.
@@ -48,6 +97,48 @@ data/speech_tracker/backups/speeches_YYYY-MM-DD.db
 
 같은 UTC 날짜에 이미 backup이 있으면 다시 만들지 않습니다. backup 파일은
 Git에 포함하지 않습니다.
+
+## SQLite 데이터 모델
+
+분석에 직접 사용되는 핵심 테이블 관계는 다음과 같습니다.
+
+```mermaid
+erDiagram
+    MEMBERS o|--o{ SPEECHES : "speaker_id"
+    SPEECHES ||--o| ANALYSIS_RESULTS : "speech_id"
+
+    MEMBERS {
+        integer id
+        string bank_code
+        string name
+        string status
+        datetime last_updated
+    }
+
+    SPEECHES {
+        integer id
+        string bank_code
+        integer speaker_id
+        string title
+        date date
+        string url
+        text full_text
+        datetime updated_at
+    }
+
+    ANALYSIS_RESULTS {
+        integer speech_id
+        float stance_score
+        string analysis_status
+        string model_name
+        string analysis_version
+        datetime analyzed_at
+    }
+```
+
+`members`는 발언자를 관리하고, `speeches`는 중앙은행 연설 원문과 metadata를
+보관합니다. `analysis_results`는 speech별 Gemini 분석 결과를 0개 또는 1개
+보관합니다.
 
 ## 분석 결과
 
