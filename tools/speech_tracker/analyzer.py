@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,8 @@ from core.config import config
 
 logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "gemini-2.5-flash"
+ANALYSIS_VERSION = "hawk_dove_v1"
+MAX_ANALYSIS_ATTEMPTS = 3
 
 
 class KeywordItem(BaseModel):
@@ -80,6 +83,11 @@ INSTRUCTIONS:
 OUTPUT: A JSON object with exactly four keys: stance_score, stance_reason,
 keywords, and main_risk.
 """
+
+
+def utc_now_iso():
+    """Return the current UTC timestamp as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class HawkDoveAnalyzer:
@@ -181,8 +189,7 @@ class HawkDoveAnalyzer:
                 )
                 conn.execute(
                     """
-                    INSERT INTO analysis_results
-                    (
+                    INSERT INTO analysis_results (
                         speech_id,
                         stance_score,
                         stance_reason,
@@ -190,17 +197,24 @@ class HawkDoveAnalyzer:
                         main_risk,
                         analysis_attempts,
                         analysis_status,
-                        analyzed_at
+                        analyzed_at,
+                        model_name,
+                        analysis_version
                     )
-                    VALUES (?, ?, ?, ?, ?, 1, ?, datetime('now'))
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     ON CONFLICT(speech_id) DO UPDATE SET
                         stance_score = excluded.stance_score,
                         stance_reason = excluded.stance_reason,
                         keywords = excluded.keywords,
                         main_risk = excluded.main_risk,
-                        analysis_attempts = analysis_attempts + 1,
+                        analysis_attempts = COALESCE(
+                            analysis_results.analysis_attempts,
+                            0
+                        ) + 1,
                         analysis_status = excluded.analysis_status,
-                        analyzed_at = excluded.analyzed_at
+                        analyzed_at = excluded.analyzed_at,
+                        model_name = excluded.model_name,
+                        analysis_version = excluded.analysis_version
                     """,
                     (
                         speech_id,
@@ -209,6 +223,9 @@ class HawkDoveAnalyzer:
                         json.dumps(result["keywords"]),
                         result["main_risk"],
                         status,
+                        utc_now_iso(),
+                        self.model,
+                        ANALYSIS_VERSION,
                     ),
                 )
                 conn.commit()
@@ -222,23 +239,84 @@ class HawkDoveAnalyzer:
             else:
                 conn.execute(
                     """
-                    INSERT INTO analysis_results
-                        (speech_id, analysis_attempts, analysis_status)
-                    VALUES (?, 1, 'pending')
+                    INSERT INTO analysis_results (
+                        speech_id,
+                        analysis_attempts,
+                        analysis_status,
+                        analyzed_at,
+                        model_name,
+                        analysis_version
+                    )
+                    VALUES (?, 1, 'pending', ?, ?, ?)
                     ON CONFLICT(speech_id) DO UPDATE SET
-                        analysis_attempts = analysis_attempts + 1
+                        analysis_attempts = COALESCE(
+                            analysis_results.analysis_attempts,
+                            0
+                        ) + 1,
+                        analysis_status = CASE
+                            WHEN COALESCE(
+                                analysis_results.analysis_attempts,
+                                0
+                            ) + 1 >= ?
+                            THEN 'failed'
+                            ELSE 'pending'
+                        END,
+                        analyzed_at = excluded.analyzed_at,
+                        model_name = excluded.model_name,
+                        analysis_version = excluded.analysis_version
+                    """,
+                    (
+                        speech_id,
+                        utc_now_iso(),
+                        self.model,
+                        ANALYSIS_VERSION,
+                        MAX_ANALYSIS_ATTEMPTS,
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT analysis_attempts, analysis_status
+                    FROM analysis_results
+                    WHERE speech_id = ?
                     """,
                     (speech_id,),
-                )
+                ).fetchone()
                 conn.commit()
                 logger.warning(
-                    "  -> [%s] [%s] Analysis failed. Attempt logged.",
+                    "  -> [%s] [%s] Analysis failed. "
+                    "Attempt %s/%s; status=%s.",
                     bank_code,
                     speech_id,
+                    row["analysis_attempts"],
+                    MAX_ANALYSIS_ATTEMPTS,
+                    row["analysis_status"],
                 )
 
             time.sleep(2)
             return bool(result)
+        finally:
+            conn.close()
+
+    def mark_exhausted_analysis_as_failed(self) -> int:
+        """Convert legacy exhausted pending rows into terminal failures."""
+        conn = self.db._get_conn()
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE analysis_results
+                SET analysis_status = 'failed'
+                WHERE analysis_status = 'pending'
+                  AND COALESCE(analysis_attempts, 0) >= ?
+                """,
+                (MAX_ANALYSIS_ATTEMPTS,),
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.warning(
+                    "Marked %s exhausted analyses as failed",
+                    cursor.rowcount,
+                )
+            return cursor.rowcount
         finally:
             conn.close()
 
@@ -248,8 +326,7 @@ class HawkDoveAnalyzer:
         try:
             cursor = conn.execute(
                 """
-                INSERT INTO analysis_results
-                (
+                INSERT INTO analysis_results (
                     speech_id,
                     analysis_attempts,
                     analysis_status,
@@ -280,17 +357,18 @@ class HawkDoveAnalyzer:
                     analysis_attempts = 1,
                     analysis_status = 'skipped',
                     stance_reason = excluded.stance_reason,
-                    keywords = '[]'
+                    keywords = '[]',
+                    model_name = NULL,
+                    analysis_version = NULL
                 """
             )
             conn.commit()
-            count = cursor.rowcount
-            if count > 0:
+            if cursor.rowcount > 0:
                 logger.info(
                     "Marked %s speeches as skipped",
-                    count,
+                    cursor.rowcount,
                 )
-            return count
+            return cursor.rowcount
         finally:
             conn.close()
 
@@ -307,7 +385,9 @@ class HawkDoveAnalyzer:
                     stance_reason = NULL,
                     keywords = NULL,
                     main_risk = NULL,
-                    analyzed_at = NULL
+                    analyzed_at = NULL,
+                    model_name = NULL,
+                    analysis_version = NULL
                 WHERE analysis_status = 'skipped'
                   AND speech_id IN (
                     SELECT id
@@ -318,13 +398,12 @@ class HawkDoveAnalyzer:
                 """
             )
             conn.commit()
-            count = cursor.rowcount
-            if count > 0:
+            if cursor.rowcount > 0:
                 logger.info(
                     "Revived %s skipped speeches with sufficient text",
-                    count,
+                    cursor.rowcount,
                 )
-            return count
+            return cursor.rowcount
         finally:
             conn.close()
 
@@ -334,6 +413,7 @@ class HawkDoveAnalyzer:
         max_workers: int = 2,
     ) -> int:
         """Analyze pending speeches in parallel."""
+        self.mark_exhausted_analysis_as_failed()
         self.revive_skipped_speeches_with_text()
         self.mark_short_speeches_as_skipped()
 
@@ -362,11 +442,12 @@ class HawkDoveAnalyzer:
                   )
                   AND (
                     ar.analysis_attempts IS NULL
-                    OR ar.analysis_attempts < 3
+                    OR ar.analysis_attempts < ?
                   )
+                ORDER BY s.date DESC, s.id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (MAX_ANALYSIS_ATTEMPTS, limit),
             ).fetchall()
         finally:
             conn.close()
@@ -407,8 +488,7 @@ class HawkDoveAnalyzer:
                     logger.error("Worker thread failed: %s", exc)
 
         logger.info(
-            "Parallel analysis complete. "
-            "Successfully analyzed %s/%s speeches.",
+            "Parallel analysis complete. Successfully analyzed %s/%s speeches.",
             analyzed_count,
             len(rows),
         )

@@ -5,7 +5,7 @@ They do not upload data anywhere. The logic is kept in Python so the future
 Snowflake SQL implementation can be checked against the existing behavior.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -19,6 +19,10 @@ class SentimentDeriver:
 
             db = SpeechDB()
         self.db = db
+
+    @staticmethod
+    def _utc_now_iso():
+        return datetime.now(timezone.utc).isoformat()
 
     def get_events_df(self):
         """Return speech-level sentiment rows used as a CORE reference."""
@@ -39,8 +43,11 @@ class SentimentDeriver:
                     ar.main_risk,
                     ar.analysis_status,
                     ar.analyzed_at,
+                    ar.model_name,
+                    ar.analysis_version,
                     s.fetched_at,
-                    s.created_at
+                    s.created_at,
+                    s.updated_at AS speech_updated_at
                 FROM speeches s
                 LEFT JOIN members m ON s.speaker_id = m.id
                 JOIN analysis_results ar ON s.id = ar.speech_id
@@ -62,17 +69,31 @@ class SentimentDeriver:
             df["date"], errors="coerce"
         ).dt.date.astype("string")
 
-        for column in ("analyzed_at", "fetched_at", "created_at"):
-            df[column] = pd.to_datetime(df[column], errors="coerce")
+        timestamp_columns = (
+            "analyzed_at",
+            "fetched_at",
+            "created_at",
+            "speech_updated_at",
+        )
+        for column in timestamp_columns:
+            df[column] = pd.to_datetime(
+                df[column],
+                errors="coerce",
+                utc=True,
+            )
 
-        speech_date = pd.to_datetime(df["date"], errors="coerce")
+        speech_date = pd.to_datetime(
+            df["date"],
+            errors="coerce",
+            utc=True,
+        )
         df["collection_lag_days"] = (
             df["fetched_at"].dt.normalize() - speech_date
         ).dt.days.astype("Int64")
         df["analysis_lag_days"] = (
             df["analyzed_at"].dt.normalize() - speech_date
         ).dt.days.astype("Int64")
-        df["updated_at"] = datetime.now().isoformat()
+        df["updated_at"] = self._utc_now_iso()
 
         columns = [
             "speech_id",
@@ -87,8 +108,11 @@ class SentimentDeriver:
             "main_risk",
             "analysis_status",
             "analyzed_at",
+            "model_name",
+            "analysis_version",
             "fetched_at",
             "created_at",
+            "speech_updated_at",
             "collection_lag_days",
             "analysis_lag_days",
             "updated_at",
@@ -105,7 +129,10 @@ class SentimentDeriver:
             (events["analysis_status"] == "scored")
             & events["stance_score"].notna()
         ].copy()
-        scored["date"] = pd.to_datetime(scored["date"], errors="coerce")
+        scored["date"] = pd.to_datetime(
+            scored["date"],
+            errors="coerce",
+        )
 
         speech_counts = (
             events.assign(
@@ -212,7 +239,7 @@ class SentimentDeriver:
         daily["last_scored_speech_date"] = daily[
             "last_scored_speech_date"
         ].dt.date.astype("string")
-        daily["updated_at"] = datetime.now().isoformat()
+        daily["updated_at"] = self._utc_now_iso()
 
         columns = [
             "date",

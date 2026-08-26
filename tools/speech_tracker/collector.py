@@ -9,7 +9,7 @@ import logging
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -34,6 +34,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def utc_now_iso():
+    """Return the current UTC timestamp as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
 def run_collection(
     banks=None,
     mode="recent",
@@ -47,7 +52,7 @@ def run_collection(
     run_id = run_id or uuid.uuid4().hex
     target_banks = banks or list(ALL_SCRAPERS.keys())
     next_run_at = next_daily_eastern_run()
-    started_at = datetime.now().isoformat()
+    started_at = utc_now_iso()
 
     append_event(
         {
@@ -76,7 +81,7 @@ def run_collection(
     error_messages = []
     successful_banks = 0
     failed_banks = 0
-    collection_started_at = datetime.now().isoformat()
+    collection_started_at = utc_now_iso()
 
     for bank_code in target_banks:
         if bank_code not in ALL_SCRAPERS:
@@ -87,12 +92,13 @@ def run_collection(
         logger.info("Processing: %s", bank_code)
         logger.info("%s", "=" * 50)
 
-        bank_started_at = datetime.now().isoformat()
+        bank_started_at = utc_now_iso()
         bank_started_perf = time.perf_counter()
         bank_status = "success"
         bank_error = None
         bank_new_count = 0
         bank_refreshed_count = 0
+        scraper = None
 
         log_pipeline_job(
             pipeline_logger,
@@ -159,7 +165,10 @@ def run_collection(
                 }
             )
         finally:
-            bank_finished_at = datetime.now().isoformat()
+            if scraper is not None:
+                scraper.close()
+
+            bank_finished_at = utc_now_iso()
             log_pipeline_job(
                 pipeline_logger,
                 f"collect_{bank_code.lower()}",
@@ -229,7 +238,7 @@ def run_collection(
     else:
         collection_status = "failed"
 
-    collection_finished_at = datetime.now().isoformat()
+    collection_finished_at = utc_now_iso()
     update_stage(
         "collection",
         started_at=collection_started_at,
@@ -240,63 +249,7 @@ def run_collection(
         details=results,
     )
 
-    maintenance_started_at = datetime.now().isoformat()
-    maintenance_perf = time.perf_counter()
-    maintenance_status = "success"
-    maintenance_error = None
-    log_pipeline_job(pipeline_logger, "member_cleanup", "running")
-
-    try:
-        from scripts.speech_tracker.migrations.apply_activity_status import (
-            apply_activity_based_status,
-        )
-
-        logger.info("Running activity-based member cleanup...")
-        apply_activity_based_status(days_threshold=365)
-        log_pipeline_job(
-            pipeline_logger,
-            "member_cleanup",
-            "success",
-            maintenance_perf,
-            days_threshold=365,
-        )
-    except Exception as exc:
-        maintenance_status = "failed"
-        maintenance_error = str(exc)
-        logger.error("Failed to run activity status update: %s", exc)
-        log_pipeline_job(
-            pipeline_logger,
-            "member_cleanup",
-            "failed",
-            maintenance_perf,
-            error_message=str(exc),
-        )
-        append_event(
-            {
-                "service": "cb-speeches",
-                "stage": "member_cleanup",
-                "status": "failed",
-                "run_id": run_id,
-                "message": str(exc),
-            }
-        )
-
-    maintenance_finished_at = datetime.now().isoformat()
-    try:
-        db.log_pipeline_step(
-            run_id=run_id,
-            stage_name="member_cleanup",
-            started_at=maintenance_started_at,
-            finished_at=maintenance_finished_at,
-            status=maintenance_status,
-            item_count=0,
-            error_msg=maintenance_error,
-            details={"days_threshold": 365},
-        )
-    except Exception as exc:
-        logger.error("Failed to save member cleanup log: %s", exc)
-
-    analysis_started_at = datetime.now().isoformat()
+    analysis_started_at = utc_now_iso()
     analysis_perf = time.perf_counter()
     analysis_count = 0
     analysis_status = "skipped"
@@ -348,7 +301,7 @@ def run_collection(
                 }
             )
 
-    analysis_finished_at = datetime.now().isoformat()
+    analysis_finished_at = utc_now_iso()
     log_pipeline_job(
         pipeline_logger,
         "initial_analysis",
@@ -395,8 +348,6 @@ def run_collection(
             )
 
     overall_status = collection_status
-    if maintenance_status == "failed" and overall_status == "success":
-        overall_status = "partial"
     if analysis_status == "failed" and overall_status == "success":
         overall_status = "partial"
 
@@ -433,12 +384,6 @@ def run_collection(
                 "total_new": total_new,
                 "total_refreshed": total_refreshed,
             },
-            "member_cleanup": {
-                "started_at": maintenance_started_at,
-                "finished_at": maintenance_finished_at,
-                "status": maintenance_status,
-                "error": maintenance_error,
-            },
             "analysis": {
                 "started_at": analysis_started_at,
                 "finished_at": analysis_finished_at,
@@ -452,7 +397,7 @@ def run_collection(
     logger.info("%s", "=" * 50)
     logger.info(
         "COLLECTION SUMMARY - %s",
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     )
     logger.info("%s", "=" * 50)
     for bank, count in results.items():
@@ -469,7 +414,6 @@ def run_collection(
         "analysis_count": analysis_count,
         "status": overall_status,
         "analysis_status": analysis_status,
-        "maintenance_status": maintenance_status,
     }
 
 
@@ -532,8 +476,10 @@ def main():
         print("Running test mode...")
         db = SpeechDB()
         for bank_code, scraper_cls in ALL_SCRAPERS.items():
+            scraper = None
             try:
-                speeches = scraper_cls(db=db).fetch_speech_list()
+                scraper = scraper_cls(db=db)
+                speeches = scraper.fetch_speech_list()
                 if speeches:
                     speech = speeches[0]
                     print(f"\n[{bank_code}] Found {len(speeches)} speeches")
@@ -547,6 +493,9 @@ def main():
                     print(f"\n[{bank_code}] No speeches found")
             except Exception as exc:
                 print(f"\n[{bank_code}] ERROR: {exc}")
+            finally:
+                if scraper is not None:
+                    scraper.close()
         return 0
 
     result = run_collection(
