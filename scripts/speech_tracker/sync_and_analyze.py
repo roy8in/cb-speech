@@ -49,6 +49,7 @@ def count_pending_analysis(db):
               AND (
                   ar.analysis_status IS NULL
                   OR ar.analysis_status = 'pending'
+                  OR ar.analysis_status = 'skipped'
               )
             """
         ).fetchone()
@@ -59,6 +60,9 @@ def count_pending_analysis(db):
 
 def run_exhaustive_analysis(db):
     """Process pending analysis rows until no processable work remains."""
+    if count_pending_analysis(db) == 0:
+        return 0
+
     analyzer = HawkDoveAnalyzer(db)
     if not analyzer.check_api_status():
         raise RuntimeError("Gemini API key is not configured")
