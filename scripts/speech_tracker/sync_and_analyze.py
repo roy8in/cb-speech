@@ -130,7 +130,6 @@ def main():
     )
 
     collection_perf = time.perf_counter()
-    collection_result = {}
     collection_failed = False
     log_pipeline_job(
         pipeline_logger,
@@ -292,7 +291,6 @@ def main():
         total_new=total_new,
         total_refreshed=total_refreshed,
         analyzed_items=total_analyzed,
-        synced_items=0,
         failed_steps="|".join(failed_steps),
     )
     update_status(
