@@ -146,7 +146,7 @@ def append_summary(
 ) -> None:
     summary_log_path.parent.mkdir(exist_ok=True)
     exists = summary_log_path.exists()
-    fieldnames = [
+    new_fieldnames = [
         "run_id",
         "started_at",
         "status",
@@ -156,23 +156,40 @@ def append_summary(
         "analyzed_items",
         "failed_steps",
     ]
+    fieldnames = new_fieldnames
+    if exists:
+        with summary_log_path.open(
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            existing_header = next(csv.reader(handle), [])
+        if existing_header:
+            fieldnames = existing_header
+
+    row = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "status": status,
+        "duration_sec": round(duration_sec, 3),
+        "total_new": total_new,
+        "total_refreshed": total_refreshed,
+        "analyzed_items": analyzed_items,
+        "failed_steps": failed_steps,
+    }
+    if "synced_items" in fieldnames:
+        row["synced_items"] = 0
+
     with summary_log_path.open(
         "a",
         newline="",
         encoding="utf-8",
     ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
         if not exists:
             writer.writeheader()
-        writer.writerow(
-            {
-                "run_id": run_id,
-                "started_at": started_at.isoformat(),
-                "status": status,
-                "duration_sec": round(duration_sec, 3),
-                "total_new": total_new,
-                "total_refreshed": total_refreshed,
-                "analyzed_items": analyzed_items,
-                "failed_steps": failed_steps,
-            }
-        )
+        writer.writerow(row)
