@@ -59,9 +59,36 @@ def test_boj_fetch_speech_list_parses_current_table(monkeypatch):
 
     assert speeches == [
         {
-            "title": '"Economic Activity, Prices, and Monetary Policy in Japan"',
+            "title": (
+                '"Economic Activity, Prices, and Monetary Policy '
+                'in Japan"'
+            ),
             "date": "2026-05-21",
-            "url": "https://www.boj.or.jp/en/about/press/koen_2026/ko260521a.htm",
+            "url": (
+                "https://www.boj.or.jp/en/about/press/"
+                "koen_2026/ko260521a.htm"
+            ),
             "speaker": "Junko Koeda",
         }
     ]
+
+
+def test_boj_dedupe_keeps_same_title_for_different_speakers():
+    speeches = [
+        {
+            "title": "Opening Remarks (Full Text)",
+            "date": "2026-05-27",
+            "url": "https://example.com/a.htm",
+            "speaker": "Kazuo Ueda",
+        },
+        {
+            "title": "Opening Remarks (Full Text)",
+            "date": "2026-05-27",
+            "url": "https://example.com/b.htm",
+            "speaker": "Ryozo Himino",
+        },
+    ]
+
+    deduped = BOJScraper._dedupe_speeches(speeches)
+
+    assert len(deduped) == 2
