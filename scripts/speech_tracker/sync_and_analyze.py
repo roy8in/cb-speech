@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -19,7 +19,11 @@ from ops_status import (
 )
 from tools.speech_tracker.analyzer import HawkDoveAnalyzer
 from tools.speech_tracker.collector import run_collection
-from tools.speech_tracker.models import SpeechDB
+from tools.speech_tracker.models import (
+    SpeechDB,
+    backup_sqlite_database,
+    get_db_path,
+)
 from tools.speech_tracker.pipeline_log import (
     append_summary,
     log_event,
@@ -35,8 +39,13 @@ logging.basicConfig(
 logger = logging.getLogger("sync_and_analyze")
 
 
+def utc_now_iso():
+    """Return the current UTC timestamp as an ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
 def count_pending_analysis(db):
-    """Count speeches that still require analysis."""
+    """Count speeches that still require an analysis attempt."""
     conn = db._get_conn()
     try:
         row = conn.execute(
@@ -87,6 +96,58 @@ def run_exhaustive_analysis(db):
     return total_analyzed
 
 
+def fail_prepare(pipeline, pipeline_logger, run_id, error):
+    """Record a preparation failure and return a non-zero exit code."""
+    duration_sec = round(
+        time.perf_counter() - pipeline["run_started_perf"],
+        3,
+    )
+    log_pipeline_job(
+        pipeline_logger,
+        "prepare_environment",
+        "failed",
+        pipeline["run_started_perf"],
+        error_message=str(error),
+    )
+    log_event(
+        pipeline_logger,
+        "error",
+        "Pipeline preparation failed",
+        run_id=run_id,
+        error_message=str(error),
+    )
+    append_summary(
+        pipeline["summary_log_path"],
+        run_id=run_id,
+        started_at=pipeline["run_started_at"],
+        status="FAILED",
+        duration_sec=duration_sec,
+        total_new=0,
+        total_refreshed=0,
+        analyzed_items=0,
+        failed_steps="prepare_environment",
+    )
+    update_status(
+        run_id=run_id,
+        state="failed",
+        next_run_at=next_daily_eastern_run(),
+        summary={
+            "status": "failed",
+            "failed_steps": "prepare_environment",
+        },
+    )
+    append_event(
+        {
+            "service": "cb-speeches",
+            "stage": "prepare_environment",
+            "status": "failed",
+            "run_id": run_id,
+            "message": str(error),
+        }
+    )
+    return 1
+
+
 def main():
     logger.info("Starting local speech pipeline...")
     run_id = uuid.uuid4().hex
@@ -109,13 +170,10 @@ def main():
         python_executable=sys.executable,
         schedule="daily 20:00 America/New_York",
     )
-    log_pipeline_job(pipeline_logger, "prepare_environment", "running")
     log_pipeline_job(
         pipeline_logger,
         "prepare_environment",
-        "success",
-        pipeline["run_started_perf"],
-        banks="FRB|ECB|BOE|BOJ|RBA|BOC",
+        "running",
     )
     update_status(
         run_id=run_id,
@@ -131,6 +189,27 @@ def main():
             "run_id": run_id,
             "message": "local pipeline started",
         }
+    )
+
+    try:
+        backup_path = backup_sqlite_database(get_db_path())
+        db = SpeechDB()
+    except Exception as exc:
+        logger.error("Pipeline preparation failed: %s", exc)
+        return fail_prepare(
+            pipeline,
+            pipeline_logger,
+            run_id,
+            exc,
+        )
+
+    log_pipeline_job(
+        pipeline_logger,
+        "prepare_environment",
+        "success",
+        pipeline["run_started_perf"],
+        banks="FRB|ECB|BOE|BOJ|RBA|BOC",
+        backup_path=backup_path or "new_database",
     )
 
     collection_perf = time.perf_counter()
@@ -151,12 +230,7 @@ def main():
         )
         total_new = collection_result.get("total_new", 0)
         total_refreshed = collection_result.get("total_refreshed", 0)
-        bank_results = collection_result.get("bank_results", {})
-        collection_failed = any(
-            count < 0 for count in bank_results.values()
-        )
-        if collection_result.get("maintenance_status") == "failed":
-            collection_failed = True
+        collection_failed = collection_result.get("status") != "success"
 
         log_pipeline_job(
             pipeline_logger,
@@ -189,11 +263,10 @@ def main():
     if collection_failed:
         failed_steps.append("collection")
 
-    analysis_started_at = datetime.now().isoformat()
+    analysis_started_at = utc_now_iso()
     analysis_perf = time.perf_counter()
     analysis_status = "success"
     analysis_error = None
-    db = SpeechDB()
     log_pipeline_job(
         pipeline_logger,
         "exhaustive_analysis",
@@ -231,7 +304,7 @@ def main():
             }
         )
 
-    analysis_finished_at = datetime.now().isoformat()
+    analysis_finished_at = utc_now_iso()
     log_pipeline_job(
         pipeline_logger,
         "exhaustive_analysis",
@@ -306,6 +379,7 @@ def main():
             "total_new": total_new,
             "total_refreshed": total_refreshed,
             "analysis_exhaustive": total_analyzed,
+            "backup_path": str(backup_path) if backup_path else None,
         },
     )
     append_event(
