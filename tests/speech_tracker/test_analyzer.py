@@ -1,55 +1,11 @@
-import pytest
 import sqlite3
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.speech_tracker.analyzer import HawkDoveAnalyzer
-
-class MockDB:
-    def _get_conn(self):
-        return MagicMock()
-
-@pytest.fixture
-def analyzer():
-    db = MockDB()
-    # Mocking check_api_status so we can test non-LLM dependent methods if needed
-    a = HawkDoveAnalyzer(db)
-    return a
-
-def test_json_parsing_resilience():
-    # Since analyze_text relies entirely on LLM now via Pydantic schema,
-    # the main resilience test is ensuring schema fields are respected.
-    from tools.speech_tracker.analyzer import StanceResult, KeywordItem
-    
-    # Simulate a valid valid pydantic output
-    valid_data = {
-        "stance_score": 0.5,
-        "stance_reason": "Test reason.",
-        "keywords": [{"category": "Inflation", "detail": "Test"}],
-        "main_risk": "Test Risk"
-    }
-    
-    model = StanceResult(**valid_data)
-    assert model.stance_score == 0.5
-    assert len(model.keywords) == 1
-    assert model.keywords[0].category == "Inflation"
-
-def test_json_parsing_null_score():
-    from tools.speech_tracker.analyzer import StanceResult
-    
-    valid_data = {
-        "stance_score": None,
-        "stance_reason": "No policy signal.",
-        "keywords": [],
-        "main_risk": None
-    }
-    
-    model = StanceResult(**valid_data)
-    assert model.stance_score is None
-    assert model.main_risk is None
+from tools.speech_tracker.analyzer import (
+    HawkDoveAnalyzer,
+    KeywordItem,
+    MAX_ANALYSIS_ATTEMPTS,
+    StanceResult,
+)
 
 
 class TempDB:
@@ -62,10 +18,44 @@ class TempDB:
         return conn
 
 
-def test_revive_skipped_speeches_with_text(tmp_path):
-    db_path = tmp_path / "speeches.db"
+def test_stance_result_accepts_valid_score():
+    data = {
+        "stance_score": 0.5,
+        "stance_reason": "Test reason.",
+        "keywords": [
+            {"category": "Inflation", "detail": "Test"}
+        ],
+        "main_risk": "Test Risk",
+    }
+
+    model = StanceResult(**data)
+
+    assert model.stance_score == 0.5
+    assert len(model.keywords) == 1
+    assert model.keywords[0] == KeywordItem(
+        category="Inflation",
+        detail="Test",
+    )
+
+
+def test_stance_result_accepts_null_score():
+    data = {
+        "stance_score": None,
+        "stance_reason": "No policy signal.",
+        "keywords": [],
+        "main_risk": None,
+    }
+
+    model = StanceResult(**data)
+
+    assert model.stance_score is None
+    assert model.main_risk is None
+
+
+def _create_analysis_db(db_path):
     conn = sqlite3.connect(db_path)
-    conn.executescript("""
+    conn.executescript(
+        """
         CREATE TABLE speeches (
             id INTEGER PRIMARY KEY,
             full_text TEXT
@@ -79,17 +69,40 @@ def test_revive_skipped_speeches_with_text(tmp_path):
             analysis_attempts INTEGER,
             analysis_status TEXT,
             analyzed_at TEXT,
-            synced_at TEXT
+            model_name TEXT,
+            analysis_version TEXT
         );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_revive_skipped_speeches_with_text(tmp_path):
+    db_path = tmp_path / "speeches.db"
+    _create_analysis_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
         INSERT INTO speeches (id, full_text) VALUES
             (1, 'short'),
             (2, printf('%.*c', 501, 'x'));
-        INSERT INTO analysis_results
-            (speech_id, stance_score, stance_reason, keywords, main_risk, analysis_attempts, analysis_status, analyzed_at, synced_at)
-        VALUES
-            (1, NULL, 'Skipped: Text too short.', '[]', NULL, 1, 'skipped', '2026-01-01', NULL),
-            (2, NULL, 'Skipped: Text too short.', '[]', NULL, 1, 'skipped', '2026-01-01', '2026-01-02');
-    """)
+        INSERT INTO analysis_results (
+            speech_id,
+            stance_reason,
+            keywords,
+            analysis_attempts,
+            analysis_status,
+            analyzed_at,
+            model_name,
+            analysis_version
+        ) VALUES
+            (1, 'Skipped: Text too short.', '[]', 1, 'skipped',
+             '2026-01-01T00:00:00+00:00', NULL, NULL),
+            (2, 'Skipped: Text too short.', '[]', 1, 'skipped',
+             '2026-01-01T00:00:00+00:00', NULL, NULL);
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -99,12 +112,65 @@ def test_revive_skipped_speeches_with_text(tmp_path):
     assert analyzer.revive_skipped_speeches_with_text() == 1
 
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("""
-        SELECT speech_id, analysis_status, analysis_attempts, stance_reason, keywords, analyzed_at, synced_at
+    rows = conn.execute(
+        """
+        SELECT speech_id, analysis_status, analysis_attempts,
+               stance_reason, keywords, analyzed_at,
+               model_name, analysis_version
         FROM analysis_results
         ORDER BY speech_id
-    """).fetchall()
+        """
+    ).fetchall()
     conn.close()
 
-    assert rows[0] == (1, "skipped", 1, "Skipped: Text too short.", "[]", "2026-01-01", None)
-    assert rows[1] == (2, "pending", 0, None, None, None, None)
+    assert rows[0] == (
+        1,
+        "skipped",
+        1,
+        "Skipped: Text too short.",
+        "[]",
+        "2026-01-01T00:00:00+00:00",
+        None,
+        None,
+    )
+    assert rows[1] == (
+        2,
+        "pending",
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_exhausted_pending_analysis_becomes_failed(tmp_path):
+    db_path = tmp_path / "speeches.db"
+    _create_analysis_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        INSERT INTO analysis_results (
+            speech_id,
+            analysis_attempts,
+            analysis_status
+        ) VALUES (1, ?, 'pending')
+        """,
+        (MAX_ANALYSIS_ATTEMPTS,),
+    )
+    conn.commit()
+    conn.close()
+
+    analyzer = HawkDoveAnalyzer.__new__(HawkDoveAnalyzer)
+    analyzer.db = TempDB(db_path)
+
+    assert analyzer.mark_exhausted_analysis_as_failed() == 1
+
+    conn = sqlite3.connect(db_path)
+    status = conn.execute(
+        "SELECT analysis_status FROM analysis_results WHERE speech_id = 1"
+    ).fetchone()[0]
+    conn.close()
+
+    assert status == "failed"
